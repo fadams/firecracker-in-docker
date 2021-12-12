@@ -1,0 +1,53 @@
+#!/bin/bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+SIZE=250
+IMAGE=focal-demo
+# To create a Docker style 12 hex character hostname use
+# the following:
+# HOSTNAME=$(tr -dc 'a-f0-9' < /dev/urandom | head -c12)
+HOSTNAME="firecracker"
+MOUNTPOINT=rootfs
+FILESYSTEM=rootfs.ext4
+
+# Create a directory for our filesystem
+mkdir -p $MOUNTPOINT
+
+# Run a container for our Docker image, then export the
+# container's filesystem to our directory
+CONTAINER=$(docker create $IMAGE)
+docker export $CONTAINER | tar xp -C $MOUNTPOINT
+
+# Create /etc/hostname and /etc/resolv.conf in rootfs.
+# Overwritten by firestarter so included here
+# for illustration purposes only
+#echo $HOSTNAME | sudo tee $MOUNTPOINT/etc/hostname >/dev/null
+#sudo cp /run/systemd/resolve/resolv.conf $MOUNTPOINT/etc/resolv.conf
+#sudo chmod 644 $MOUNTPOINT/etc/hostname $MOUNTPOINT/etc/resolv.conf
+
+# Create filesystem from directory contents using mkfs.ext4
+# Use fakeroot to ensure filesystem has root:root ownership
+# https://manpages.debian.org/buster/fakeroot/fakeroot.1.en.html
+# https://man7.org/linux/man-pages/man8/mke2fs.8.html
+fakeroot sh -c "mkfs.ext4 -L '' -N 0 -d ${MOUNTPOINT} -m 5 -r 1 ${FILESYSTEM} ${SIZE}M"
+
+rm -rf $MOUNTPOINT
+docker rm $CONTAINER
+

@@ -1,0 +1,56 @@
+#!/bin/bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+SIZE=250
+IMAGE=focal-demo
+# To create a Docker style 12 hex character hostname use
+# the following:
+# HOSTNAME=$(tr -dc 'a-f0-9' < /dev/urandom | head -c12)
+HOSTNAME="firecracker"
+MOUNTPOINT=rootfs
+FILESYSTEM=rootfs.ext4
+
+# Prepare empty file of $SIZE MiB to accomodate filesystem
+dd if=/dev/zero of=$FILESYSTEM bs=1M count=$SIZE
+
+# Create an empty ext4 filesystem in the file
+mkfs.ext4 $FILESYSTEM
+
+# Create a mountpoint and mount our filesystem
+mkdir -p $MOUNTPOINT
+sudo mount $FILESYSTEM $MOUNTPOINT
+
+# Run a container for our Docker image, then export the
+# container's filesystem to our mountpoint
+CONTAINER=$(docker run -d $IMAGE /bin/bash)
+docker export $CONTAINER | sudo tar xp -C $MOUNTPOINT
+
+# Create /etc/hostname and /etc/resolv.conf in rootfs.
+# Overwritten by firestarter so included here
+# for illustration purposes only
+#echo $HOSTNAME | sudo tee $MOUNTPOINT/etc/hostname >/dev/null
+#sudo cp /run/systemd/resolve/resolv.conf $MOUNTPOINT/etc/resolv.conf
+#sudo chmod 644 $MOUNTPOINT/etc/hostname $MOUNTPOINT/etc/resolv.conf
+
+# Unmount, then tidy up the container and mountpoint.
+sudo umount $MOUNTPOINT
+rm -rf $MOUNTPOINT
+docker rm $CONTAINER
+
