@@ -1,0 +1,10 @@
+
+# First exclude everything
+**
+*.*
+
+# Then explicitly allowlist what is required
+!kernel/vmlinux
+!resources/firestarter
+!rootfs/rootfs.ext4
+

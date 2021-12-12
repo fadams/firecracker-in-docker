@@ -1,0 +1,350 @@
+#!/bin/bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+#-------------------------------------------------------------------------------
+# This script is intended to be the ENTRYPOINT for firecracker-in-docker.
+# It first sets up the Firecracker MicroVM kernel boot parameters and
+# configures its init to use the init-entrypoint script generated as part of
+# creating the Firecracker rootfs (if present). As part of configuring init
+# any env vars added to the container via docker run -e/--env options are
+# inferred and "injected" into the init-entrypoint script.
+# Next the container's hostname (appended with -firecracker) and resolv.conf
+# are copied to the Firecracker rootfs and finally the script configures the
+# network, then launches the Firecracker MicroVM using the configured kernel
+# and rootfs.
+#
+# Environment variables prefixed by FC_ are reserved for configuring
+# firecracker-in-docker and are not passed to the guest.
+# The following are currently supported:
+#
+# FC_KERNEL_LOGLEVEL: Set guest kernel loglevel boot parameter value
+# FC_KERNEL_BOOTARGS: Set or override guest kernel boot parameter values.
+#   This allows advanced users to specify specific values e.g.
+#   using -e FC_KERNEL_BOOTARGS="8250.nr_uarts=0" could improve boot time
+#   at the expense of disabling the serial console (which may lead to
+#   unexpected behaviour). YMMV with this option and the defaults seem OK.
+# FC_EPHEMERAL_STORAGE: Configures the root filesystem size. If unset,
+#   the default is to resize the root filesystem to double its minimised
+#   size. If it is set to a value greater than zero then the root filesystem
+#   will be resized to the specified size, as interpreted by resize2fs
+#   https://man7.org/linux/man-pages/man8/resize2fs.8.html
+#   If no units are specified, they are interpreted to be the file system
+#   blocksize. Alternatively the units may be suffixed by one 'K', 'M', 'G',
+#   'T' (upper or lower-case) for power-of-two kilobytes, megabytes, etc.
+#   If set to zero  then the root filesystem will not be resized.
+# FC_VCPU_COUNT: Set vcpu_count (ignored if --cpus= is used). Default is 2
+# FC_MEM_SIZE: Set mem_size_mib (ignored if --memory= is used). Default is 2048
+# FC_HT_ENABLED: Enable hyperthreading. Disabled by default, which seems
+#   to be the case for most Firecracker examples.
+#-------------------------------------------------------------------------------
+
+# https://vaneyckt.io/posts/safer_bash_scripts_with_set_euxo_pipefail/
+set -euo pipefail
+
+# For Docker /proc/sys/net/ipv4/ip_forward should already be 1, because Docker
+# uses IPv4 forwarding itself. If this isn't set, restarting Docker on host
+# should fix. sudo service restart docker or sudo systemctl restart docker
+# should work. It can also be set by running one of the following commands
+# sysctl -w net.ipv4.conf.all.forwarding=1
+# sh -c "echo 1 > /proc/sys/net/ipv4/ip_forward"
+if [[ $(< /proc/sys/net/ipv4/ip_forward) != "1" ]]; then
+    echo "WARNING: IPv4 forwarding is disabled. Networking will not work."
+    exit 1
+fi
+
+
+# Paths to the Firecracker kernel and root filesystem
+KERNEL_IMAGE_PATH="/usr/local/bin/vmlinux"
+ROOTFS="/usr/local/bin/rootfs.ext4"
+
+
+# Resize the root filesystem based on the FC_EPHEMERAL_STORAGE settings.
+# The firecracker-in-docker images mages created by image-builder are built
+# with the root filesystem deliberately shrunk to contain only those blocks
+# that are actually used. This step will grow it again to a configurable
+# (or default) larger size that in essence creates some (ephemeral) writable
+# space analogous to a regular container's writable layer.
+# Run e2fsck with -y to non-interactively fix any issues with rootfs.
+# The && true prevents any non zero error code causing the script to terminate.
+e2fsck -y $ROOTFS &>/dev/null && true
+if [ -z ${FC_EPHEMERAL_STORAGE+x} ]; then # If FC_EPHEMERAL_STORAGE is unset
+    FSCK_RESULTS=($(e2fsck -n $ROOTFS 2> /dev/null))
+    # The output of e2fsck will be of the form:
+    # rootfs.ext4: clean, 29955/74240 files, 260774/296704 blocks
+    # so we parse into an array and blocks will be the 4th entry.
+    USED_BLOCKS=$(echo ${FSCK_RESULTS[4]} | cut -d"/" -f1)
+    USED_BLOCKS=$((USED_BLOCKS*2))
+
+    # Grow the root filesystem to its new size.
+    resize2fs $ROOTFS $USED_BLOCKS &>/dev/null && true
+elif [[ $FC_EPHEMERAL_STORAGE != "0" ]]; then
+    # Grow the root filesystem to its new size.
+    resize2fs -f $ROOTFS $FC_EPHEMERAL_STORAGE &>/dev/null && true
+fi
+
+
+# Kernel boot parameters are documented in:
+# https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+# https://www.kernel.org/doc/Documentation/filesystems/nfs/nfsroot.txt
+# It's worth covering the reasoning behind some of these as used here:
+#
+# The console=ttyS0 option configures the kernel to use the serial console,
+# which is needed to see the VM's stdout, and also if systemd is used in a
+# guest it will hang for 90s on start up if a console is not available.
+#
+# The noapic reboot=k panic=1 pci=off options should be fairly obvious, because
+# firecracker has no PCI bus and a simple ctrl-alt-del reboot handler and we
+# don't need the IOAPIC and want to wait one second before rebooting on panic.
+#
+# The entropy available with the firecracker MicroVM is pretty low,
+# as may be seen by running the following with the default boot parameters:
+# cat /proc/sys/kernel/random/entropy_avail
+#
+# This causes issues (hangs) with applications that need entropy e.g. Python.
+# https://lwn.net/Articles/693189/ and https://bugs.python.org/issue25420
+# There is a discussion on the topic in firecracker-microvm issues:
+# https://github.com/firecracker-microvm/firecracker/issues/663
+# https://github.com/firecracker-microvm/firecracker-containerd/issues/325
+#
+# One option to mitigate this is the random.trust_cpu=on option (or add
+# RANDOM_TRUST_CPU to the kernel config when compiling). Note however that
+# this is only available for kernels > v4.19, so the stock v4.14.174
+# kernel referenced in the Firecracker quick start will not benefit and
+# can cause issues for Python applications using that kernel in Firecracker.
+# Note that trusting the hardware RNG can be a controversial topic
+# https://lwn.net/Articles/760584/, but the option gives a choice whether
+# trusting RDRAND is worth it to avoid hangs due to userspace trying to get
+# cryptographic-grade entropy early in the boot process.
+# TODO: Another option, where trusting the hardware RNG is problematic, may be:
+# https://www.av8n.com/computer/htm/secure-random.htm#sec-sneakernet
+# The gist is to copy randomness from the host:
+# dd if=/dev/urandom of=/thumb/random.seed bs=512 count=2
+# and inject them onto the guest:
+# cat /path/to/random.seed > /dev/urandom
+# This is not done here, but could be done in a similar way to how we inject
+# env vars into /sbin/init-entrypoint later, where we could create a seed
+# file in the container and copy that to the rootfs and cat that to
+# /dev/urandom as part of the init.
+#
+# The i8042 options disable probing for the device, as documented in:
+# https://github.com/firecracker-microvm/firecracker/blob/main/docs/api_requests/actions.md#intel-and-amd-only-sendctrlaltdel
+# Note that disabling probing prevents log messages that aren't dropped by
+# setting loglevel=0, but the device is still active and SendCtrlAltDel still
+# works (if Firecracker is started with --api-sock /tmp/firecracker.socket)
+#
+# From https://github.com/firecracker-microvm/firecracker-demo/blob/main/start-firecracker.sh
+# tsc=reliable disables clocksource verification at runtime as well as the
+# stability checks done at bootup. Used to enable high-resolution timer mode
+# on older hardware, and in virtualised environments.
+# Disable ipv6 because we're routing internally using ipv4, so may as well
+# reduce boot time and available guest kernel surface.
+FC_KERNEL_LOGLEVEL="${FC_KERNEL_LOGLEVEL:-0}" # Default kernel loglevel is 0
+FC_KERNEL_BOOTARGS="${FC_KERNEL_BOOTARGS:-}"  # No additional args by default.
+BOOT_ARGS="ro noapic console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd tsc=reliable ipv6.disable=1 loglevel=${FC_KERNEL_LOGLEVEL}"
+
+
+# Infer env vars that have been added at run-time via Docker's -e/--env
+# by comparing against a list of "standard" variables. Note that this
+# approach will fail if an application actually happens to *want* to
+# pass any of the ignored values. This edge case is catered for by
+# escaping the required var with underscores e.g. -e __PATH__="some value".
+# If an application requires a double underscored variable then it should be
+# escaped by double underscores e.g. for __KEY__ use -e  ____KEY____="value".
+# env vars prefixed by FC_ are reserved for configuring firecracker-in-docker.
+#
+# The parsing approach used below is based on the following stackoverflow post.
+# https://stackoverflow.com/questions/56633343/print-all-environment-variables-but-skipping-multiline-variables
+CONTAINER_ENV_VARS=""
+while read -r -d '' line; do
+    [[ ! $line =~ ^(HOSTNAME|PWD|HOME|TERM|SHLVL|PATH|OLDPWD|_|FC_.*)= ]] && CONTAINER_ENV_VARS=${CONTAINER_ENV_VARS}$(echo "export \"$(echo $line | sed -e 's/__\(.*\)__/\1/g')\"")"\n"
+done < <(env -0)
+#echo -e "$CONTAINER_ENV_VARS"
+
+# Write the inferred env vars to /etc/profile.d to be read by init
+# Use e2cp so we can modify the Firecracker rootfs without needing mount
+echo -e "$CONTAINER_ENV_VARS" | e2cp -O 0 -G 0 -P 644 - ${ROOTFS}:/etc/profile.d/01-container-env-vars.sh
+
+
+# Firecracker respects CPU and memory cgroup limits that may be applied
+# via Docker's --cpus= and --memory= options, however we need values for
+# vcpu_count and mem_size_mib for the machine-config section of vmconfig.
+# Firecracker can overcommit VCPU and memory, so in theory one could start
+# all instances with more resources specified than actually required,
+# but that means creating more VCPU threads than necessary or mapping
+# more memory. To avoid that we infer an approprate FC_VCPU_COUNT and
+# FC_MEM_SIZE from any container limits that have been specified, or if
+# container limits have not been set use those env vars or, finally,
+# fall back to default values of 2xVCPU and 2048MiB memory.
+# TODO investigate the memory balloon device which can be used to
+# reclaim and give back guest memory (requires guest kernel support)
+# https://github.com/firecracker-microvm/firecracker/blob/main/docs/ballooning.md
+if [ -f /sys/fs/cgroup/memory/memory.limit_in_bytes ]; then
+    limit_in_bytes=$(cat /sys/fs/cgroup/memory/memory.limit_in_bytes)
+    if [ $limit_in_bytes != "9223372036854771712" ]; then
+        FC_MEM_SIZE=$(( $limit_in_bytes/1048576 ))
+    fi
+fi
+FC_MEM_SIZE="${FC_MEM_SIZE:-2048}" # Default mem_size_mib is 2048
+
+if [ -f /sys/fs/cgroup/cpu/cpu.cfs_quota_us ]; then
+    cfs_quota_us=$(cat /sys/fs/cgroup/cpu/cpu.cfs_quota_us)
+    cfs_period_us=$(cat /sys/fs/cgroup/cpu/cpu.cfs_period_us)
+    if [ $cfs_quota_us != "-1" ]; then
+        # The --cpus= value is actually cfs_quota_us/cfs_period_us
+        # https://docs.docker.com/config/containers/resource_constraints/#configure-the-default-cfs-scheduler
+        # The calculation below rounds up the result of integer division
+        # https://stackoverflow.com/questions/2395284/round-a-divided-number-in-bash/24253318#24253318
+        FC_VCPU_COUNT=$(( ($cfs_quota_us + $cfs_period_us - 1)/$cfs_period_us ))
+    fi
+fi
+FC_VCPU_COUNT="${FC_VCPU_COUNT:-2}" # Default vcpu_count is 2
+
+# Set FC_HT_ENABLED to false if not specified else convert to lowercase
+FC_HT_ENABLED="${FC_HT_ENABLED:-false}" # Default ht_enabled is false
+FC_HT_ENABLED=$(echo $FC_HT_ENABLED | tr '[:upper:]' '[:lower:]')
+
+
+# If the Firecracker rootfs has been populated with /sbin/init-entrypoint,
+# update the Firecracker kernel init boot argument to use that.
+# Use e2ls to directly check Firecracker rootfs without needing mount.
+# Unfortunately it's not as simple as just doing the obvious
+# e2ls $ROOTFS:/sbin/init-entrypoint
+# because many modern Linux distros (e.g. Ubuntu 20.04) are migrating
+# to place all executables in say /usr/bin and symlinking to there.
+# Unfortunately e2ls doesn't follow symlinks, so we explicitly check
+# the most likely paths in order of likelihood and guard for failures.
+INIT_PATH="/sbin/"
+ENTRYPOINT=$(e2ls ${ROOTFS}:/sbin/init-entrypoint 2> /dev/null || true)
+[ -z "$ENTRYPOINT" ] && INIT_PATH="/usr/sbin/"
+ENTRYPOINT=${ENTRYPOINT:-$(e2ls ${ROOTFS}:/usr/sbin/init-entrypoint 2> /dev/null || true)}
+[ -z "$ENTRYPOINT" ] && INIT_PATH="/usr/bin/"
+ENTRYPOINT=${ENTRYPOINT:-$(e2ls ${ROOTFS}:/usr/bin/init-entrypoint 2> /dev/null || true)}
+
+# Use /sbin/init-entrypoint if present
+if [ ! -z "$ENTRYPOINT" ]; then
+    BOOT_ARGS="${BOOT_ARGS} init=/sbin/init-entrypoint"
+
+    # If the container is started with command line args and we're using
+    # init-entrypoint then pass the args to init. This turns out to be
+    # quite a convoluted process. In an ideal world it should be relatively
+    # simple as "everything after “--” is passed as an argument to init."
+    # https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html
+    # However, there was a bug in Firecracker where it appends arguments like
+    # root= and virtio_mmio.device= after user supplied arguments.
+    # https://github.com/firecracker-microvm/firecracker/issues/2709
+    # https://github.com/firecracker-microvm/firecracker/pull/2716
+    # This issue has been resolved in the Firecracker v0.25.2 release.
+    # https://github.com/firecracker-microvm/firecracker/releases/tag/v0.25.2
+    # However, even with that fix there is still an issue with respect
+    # to escaping double quotes in command lines like: -c 'echo "hello world"'
+    # This gets sent to init as: -c 'echo hello world"' without the double quote
+    # before the h in hello. This seems to be a kernel bug, so for now package
+    # into an env var and have init-entrypoint use that to add to the arg list.
+    if [ $# -ne 0 ]; then
+        INIT_ARGS=""
+        for i in "$@"; do INIT_ARGS="${INIT_ARGS}'$i' "; done
+        INIT_ARGS=$(echo $INIT_ARGS | sed 's/\"/\\\"/g')
+        #echo "$INIT_ARGS"
+
+        CONTAINER_ENV_VARS=${CONTAINER_ENV_VARS}$(echo "export \"INIT_ARGS=$INIT_ARGS\"")"\n"
+        echo -e "$CONTAINER_ENV_VARS" | e2cp -O 0 -G 0 -P 644 - ${ROOTFS}:/etc/profile.d/01-container-env-vars.sh
+    fi
+fi
+
+
+# Copy the container's hostname appended with -firecracker to Firecracker rootfs
+# Use e2cp so we can modify the Firecracker rootfs without needing mount
+echo "$(cat /etc/hostname)-firecracker" | e2cp -O 0 -G 0 - ${ROOTFS}:/etc/hostname
+# Copy container's resolv.conf to Firecracker rootfs again with e2cp
+e2cp -p /etc/resolv.conf ${ROOTFS}:/etc/resolv.conf
+
+
+INTERFACE=eth0
+TAP_DEVICE_NAME="tap0"
+
+GUEST_IP=172.16.0.2 # Comment this line out to use the random values below
+GUEST_IP="${GUEST_IP:-$(echo 172.$((RANDOM%(31-16+1)+16)).$((RANDOM%256)).$((RANDOM%(254-2+1)+2)))}"
+PREFIX=$(echo $GUEST_IP | cut -f1,2,3 -d\.)
+GATEWAY_IP="${GATEWAY_IP:-$(echo ${PREFIX}.1)}"
+
+GUEST_MAC="FE:05$(for i in {1..8}; do printf '%X' $(($RANDOM % 16)); done | sed -e 's/\(..\)/:\1/g')"
+
+#echo $GUEST_IP
+#echo $PREFIX
+#echo $GATEWAY_IP
+
+# Update Firecracker kernel boot arguments with network config
+BOOT_ARGS="${BOOT_ARGS} ip=${GUEST_IP}::${GATEWAY_IP}:255.255.255.0::eth0:off"
+
+
+# Set up networking between the parent container and Firecracker VM.
+# This is (mostly) the same pattern described in the Firecracker docs:
+# https://github.com/firecracker-microvm/firecracker/blob/main/docs/network-setup.md#on-the-host
+ip tuntap add mode tap $TAP_DEVICE_NAME
+
+ip addr add $GATEWAY_IP/24 dev $TAP_DEVICE_NAME
+ip link set dev $TAP_DEVICE_NAME up
+
+iptables -A POSTROUTING -t nat -o $INTERFACE -j MASQUERADE
+iptables -A FORWARD -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+iptables -A FORWARD -i $TAP_DEVICE_NAME -o $INTERFACE -j ACCEPT
+
+# This line is an addition to that described in the Firecracker documentation.
+# It is basically setting up port forwarding from the container to Firecracker.
+# It forwards everything on the container's eth0 interface to the MicroVMs IP.
+# https://www.adamintech.com/how-to-use-iptables-for-port-forwarding/
+# https://jensd.be/343/linux/forward-a-tcp-port-to-another-ip-or-port-using-nat-with-iptables
+iptables -A PREROUTING -t nat -i $INTERFACE -j DNAT --to-destination $GUEST_IP
+
+# Export VM configuration file
+cat <<EOF > /tmp/vmconfig.json
+{
+    "boot-source": {
+        "kernel_image_path": "$KERNEL_IMAGE_PATH",
+        "boot_args": "$BOOT_ARGS $FC_KERNEL_BOOTARGS"
+    },
+    "drives": [
+        {
+            "drive_id": "rootfs",
+            "path_on_host": "$ROOTFS",
+            "is_root_device": true,
+            "is_read_only": false
+        }
+    ],
+    "network-interfaces": [
+        {
+            "iface_id": "eth0",
+            "guest_mac": "$GUEST_MAC",
+            "host_dev_name": "$TAP_DEVICE_NAME"
+        }
+    ],
+    "machine-config": {
+        "vcpu_count": $FC_VCPU_COUNT,
+        "mem_size_mib": $FC_MEM_SIZE,
+        "ht_enabled": $FC_HT_ENABLED
+    }
+}
+EOF
+
+#cat /tmp/vmconfig.json
+
+# Launch firecracker with env -i to sanitise the environment.
+exec env -i /usr/local/bin/firecracker --no-api --config-file /tmp/vmconfig.json
+

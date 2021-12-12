@@ -1,0 +1,40 @@
+#!/bin/bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+
+# The capabilities added here are a subset of the default
+# Docker capabilities, with NET_ADMIN being the only one
+# not part of the Docker defaults. These capabilities are
+# needed to run ip and iptables, used to set up the network
+# between the container and Firecracker.
+# Unfortunately using --security-opt no-new-privileges
+# isn't an option with this application because we use copies
+# of ip and iptables that have  additional capabilities set.
+# https://www.kernel.org/doc/html/latest/userspace-api/no_new_privs.html
+docker run --rm -it \
+    --cap-drop all \
+    --cap-add NET_RAW \
+    --cap-add NET_ADMIN \
+    --group-add $(cut -d: -f3 < <(getent group kvm)) \
+    --device=/dev/kvm \
+    --device /dev/net/tun \
+    -u $(id -u):$(id -g) \
+    firecracker-in-docker
+
