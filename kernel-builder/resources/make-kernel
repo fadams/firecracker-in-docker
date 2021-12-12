@@ -1,0 +1,92 @@
+#!/bin/bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+KERNEL_VERSION=5.10.77
+KERNEL_MIRROR=https://mirrors.edge.kernel.org/pub/linux/kernel
+
+INTERACTIVE=false
+OUTPUT=false
+
+# Simple semantic version comparison operator from:
+# https://stackoverflow.com/questions/4023830/how-to-compare-two-strings-in-dot-separated-version-format-in-bash
+
+verlte() {
+    [  "$1" = "`echo -e "$1\n$2" | sort -V | head -n1`" ]
+}
+
+
+if [[ $1 == "-h" || $1 == "--help" ]]; then
+    echo "Usage: $(basename $0) [-hio] <kernel version e.g. v5.14>"
+    echo "    -h, --help        display this usage message"
+    echo "    -i, --interactive launch interactive kernel menuconfig"
+    echo "    -o, --output      output compiled vmlinux to stdout"
+    exit 0
+fi
+
+# Loop through arguments setting features.
+for arg; do
+    [[ $arg =~ ([0-9]+)\.([0-9]+) ]] && KERNEL_VERSION=$arg
+    [[ $arg == -*"i"* || $arg == "--interactive" ]] && INTERACTIVE=true
+    [[ $arg == -*"o"* || $arg == "--output" ]] && OUTPUT=true
+done
+
+if [[ $OUTPUT == true && $INTERACTIVE == true ]]; then
+    echo "The output and interactive options are mutually exclusive"
+    exit 0
+fi
+
+# /pub/linux/kernel/ has directories based on "major" version e.g. v5.x
+MAJOR="v$(echo $KERNEL_VERSION | cut -d'.' -f1)"
+VERSION_DIR="$MAJOR.x"
+
+KERNEL_NAME="linux-$KERNEL_VERSION"
+RESOURCE="$KERNEL_NAME.tar.xz"
+
+echo "Building kernel ${KERNEL_VERSION}" 1>&2
+echo "Downloading ${KERNEL_MIRROR}/${VERSION_DIR}/${RESOURCE}"
+
+rm -f linux
+[ ! -d "$KERNEL_NAME" ] && curl -sSL ${KERNEL_MIRROR}/${VERSION_DIR}/${RESOURCE} | tar -xJ
+ln -s $KERNEL_NAME linux
+
+cd linux
+
+# If .config isn't in build directory copy closest template kernel config
+if [ ! -f .config ]; then
+    for config in $(ls /usr/local/bin/microvm-kernel-x86_64.${MAJOR}.* | sort -V); do
+        version=$(echo $config | sed -e 's/\/usr\/local\/bin\/microvm-kernel-x86_64\.v\(.*\)\.config/\1/')
+        ! verlte $version $KERNEL_VERSION && break
+        CONFIG=$config
+    done
+
+    echo "Copying template kernel config: $CONFIG"
+    cp $CONFIG .config
+fi
+
+# Run make menuconfig if the interactive switch has been set on command line
+[[ $INTERACTIVE == true && $OUTPUT == false ]] && make menuconfig
+
+make vmlinux -j $(nproc) 1>&2
+
+# Output compiled kernel to stdout if required.
+# N.B. *do not* use with docker run -t option as that will cause \n to be
+# output as \r\n see https://github.com/moby/moby/issues/8513
+[[ $OUTPUT == true ]] && cat vmlinux
+

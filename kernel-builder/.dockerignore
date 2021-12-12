@@ -1,0 +1,8 @@
+
+# First exclude everything
+**
+*.*
+
+# Then explicitly allowlist what is required
+!resources
+
