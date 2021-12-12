@@ -1,0 +1,700 @@
+#!/bin/bash
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+# https://vaneyckt.io/posts/safer_bash_scripts_with_set_euxo_pipefail/
+set -euo pipefail
+
+# Parse the registry URL, normalised image name and tag
+# from the supplied image name, defaulting to the Docker
+# Hub registry if registry is not specified in the usual
+# image name convention e.g. my-registry-host:443/my-image.
+# https://docs.docker.com/engine/reference/commandline/tag/#extended-description
+# https://stackoverflow.com/questions/37861791/how-are-docker-image-names-parsed
+parse_image_name() {
+    local image=$1
+    local prefix=$([ -z "${image##*/*}" ] && echo $image | cut -d"/" -f1)
+    if [[ $prefix =~ [\.:]|localhost ]]; then
+        # Remove registry prefix to normalise image name
+        image=$(echo $image | cut -d"/" -f2)
+        local registry_URL="https://$prefix"
+    else
+        # Add "library" prefix if image isn't namespaced
+        [ -z $prefix ] && image="library/$image"
+        registry_URL="https://registry-1.docker.io"
+    fi
+
+    # Parse tag and image from normalised image name
+    if [ -z "${image##*:*}" ]; then
+        local tag=$(echo $image | cut -d":" -f2)
+        image=$(echo $image | cut -d":" -f1)
+    else
+        local tag="latest"
+    fi
+
+    echo "$registry_URL $image $tag"
+}
+
+
+# Get the bearer authentication token needed to pull the image.
+# https://docs.docker.com/registry/spec/auth/jwt/
+# https://docs.docker.com/registry/spec/auth/token/#example
+# Note that the url/service values here relate to Docker Hub and
+# won't be valid for private registries that use bearer token
+# TODO AWS ECR for example has its own GetAuthorizationToken API.
+# https://docs.aws.amazon.com/AmazonECR/latest/APIReference/API_GetAuthorizationToken.html
+# that may also be accessed via the AWS CLI get-authorization-token command
+# https://awscli.amazonaws.com/v2/documentation/api/latest/reference/ecr/get-authorization-token.html
+# aws ecr get-authorization-token
+get_dockerhub_auth_token() {
+    local auth_URL="https://auth.docker.io"
+    local service="registry.docker.io"
+    local token=$(curl -fsSL "${auth_URL}/token?service=${service}&scope=repository:${image}:pull" | jq --raw-output .token)
+    echo "$token"
+}
+
+
+# Make curl work with self-signed certs
+# https://curl.se/docs/sslcerts.html
+# N.B. this tells curl to *not* verify the peer, which
+# might well be fine for trusted private registries.
+# A more secure option is to use --cacert [file] or
+# add the CA cert for your registry to the existing
+# default CA certificate store e.g. /etc/ssl/certs
+curl_ca_verification() {
+    [[ $1 != "https://registry-1.docker.io" ]] && echo "--insecure"
+}
+
+
+# Get the image manifest document from the image registry.
+# The manifests query could return a manifest list as per:
+# https://docs.docker.com/registry/spec/manifest-v2-2/
+# If so we extract the digest that relates to linux amd64
+# and use that to call get_manifest again.
+get_manifest() {
+    local URL=$1
+    local token=$2
+    local image=$3
+    local digest=$4
+
+    local query=$(curl -fsSL $(curl_ca_verification $URL) \
+        -H "Authorization: Bearer $token" \
+        -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+        -H 'Accept: application/vnd.docker.distribution.manifest.v1+json' \
+        -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+        "${URL}/v2/${image}/manifests/${digest}")
+
+    if [[ $(echo $query | jq --raw-output 'has("manifests")') == true ]]; then
+        digest=$(echo $query | jq --raw-output '.manifests[] | select(.platform.architecture=="amd64") | select(.platform.os=="linux") | .digest')
+        get_manifest $URL $token $image $digest
+    else
+        echo $query
+    fi
+}
+
+
+# Get image blob (e,g, config or layer) from the registry.
+get_blob() {
+    local URL=$1
+    local token=$2
+    local image=$3
+    local digest=$4
+
+    curl -fsSL $(curl_ca_verification $URL) \
+        -H "Authorization: Bearer $token" \
+        "${URL}/v2/${image}/blobs/${digest}"
+}
+
+
+# Some images might have been created with some directories set to
+# mode 666 or 660 e.g. unwritable even by owner. This can be awkward
+# when trying to create a root filesystem as an unprivileged user as
+# subsequent layers will be unable to untar into the unwritable
+# directory (among other issues). To resolve this we find all such
+# unwritable directories and chmod them to make them user writable.
+# We return the directories we've found so that we can concatenate
+# with those found in other layers and eventually set them back to
+# unwritable after we've unpacked the entire image's root filesystem.
+chmod_unwritable_dirs() {
+    local rootfs=$1
+    local unwritable_dirs=$(find $rootfs -type d ! -writable)
+
+    for item in $unwritable_dirs; do chmod u+w $item; done
+    echo "$unwritable_dirs"
+}
+
+
+# With some images some files (most notably shadow and gshadow) get
+# set unreaable even by the owner. This is usually mod 000 and usually
+# the shadow/gshadow files. The idea behind setting /etc/shadow permissions
+# to 000 is to protect it from being accessed by daemons, even when running
+# as root, by ensuring that access is controlled by the DAC_OVERRIDE capability.
+# Unfortunately this makes it impossible for an unpriviliged user to copy
+# such files when building the root filesystem, so we make them readable
+# here (basically 600 vice 000) and will adjust the permissions back later.
+chmod_unreadable_dirs() {
+    local rootfs=$1
+
+    for item in $(find $rootfs -type f ! -readable); do
+        chmod u+r $item
+        if [ -z "${item##*shadow-}" ]; then # Delete shadow/gshadow backups
+            rm -f $item
+        fi
+    done
+}
+
+
+# The OCI layer specification represents deleted files or
+# directories with a file prefixed with .wh.
+# https://github.com/opencontainers/image-spec/blob/main/layer.md#whiteouts
+delete_marked_items() {
+    local rootfs=$1
+
+    for item in $(find $rootfs -type f -name ".wh.*"); do
+        rm -rf ${item/.wh./} # Remove marked path
+        rm -rf $item # Remove marker file
+    done
+}
+
+
+# The init-entrypoint that we generate is a simple shell script, so requires
+# /bin/sh to run and a few other executables to work as intended.
+# To support scratch and other minimal images we download and cache some
+# busybox executables and use those if the required executable is not
+# present in the rootfs. We cache the busybox executables, because although
+# they are small for some reason the downloads are quite slow.
+check_and_install() {
+    local rootfs=$1
+    local executable=$2
+
+    if [ ! -f "${rootfs}${executable}" ]; then
+        local name=$(basename "$executable")
+        echo "Warning: rootfs has no ${executable}, installing ${name} from busybox"
+        mkdir -p $rootfs/bin
+
+        if [ ! -d "busybox_cache" ]; then
+            local busybox_path="https://www.busybox.net/downloads/binaries/1.30.0-i686"
+            mkdir -p busybox_cache
+            echo "Downloading busybox_ASH to local cache"
+            curl -fsSL "$busybox_path/busybox_ASH" -o busybox_cache/sh
+            echo "Downloading busybox_HOSTNAME to local cache"
+            curl -fsSL "$busybox_path/busybox_HOSTNAME" -o busybox_cache/hostname
+            echo "Downloading busybox_CAT to local cache"
+            curl -fsSL "$busybox_path/busybox_CAT" -o busybox_cache/cat
+            echo "Downloading busybox_MOUNT to local cache"
+            curl -fsSL "$busybox_path/busybox_MOUNT" -o busybox_cache/mount
+            chmod +x busybox_cache/*
+        fi
+        cp busybox_cache/${name} ${rootfs}${executable}
+    fi
+}
+
+
+# Generate an init script for Firecracker so that it inits in the same
+# way as a Docker container. If the Docker image specifies an ENTRYPOINT
+# of /sbin/init we use that directly.If, however, the image specifies a
+# regular application as the ENTRYPOINT/CMD, as is more typical for Docker,
+# we generate a simple init-entrypoint script that will set the ENV vars
+# specified in the image or passed at run time and also set WORKDIR, hostname,
+# mount /proc, then finally exec the specified ENTRYPOINT/CMD application
+# so that it replaces the init-entrypoint script as PID 1.
+generate_init() {
+    local rootfs=$1
+    local config=$2
+
+    local config=$(echo "$config" | jq --raw-output .config)
+    local workdir=$(echo "$config" | jq --raw-output .WorkingDir)
+
+    # If WorkingDir is empty or unset in the image config, default workdir to /
+    [[ $workdir == "" || $workdir == "null" ]] && workdir="/"
+
+    # Convert JSON arrays to bash arrays, treating null as an empty array.
+    # https://stackoverflow.com/questions/54794749/jq-error-at-stdin0-cannot-iterate-over-null-null
+    # We also temporarily change the Internal Field Separator (IFS) to newline
+    # so that array conversion doesn't split on spaces, as we want e.g.
+    # "Cmd":["/bin/sh","-c","echo \"Hello World\""] to be parsed to
+    # [/bin/sh, -c, echo "Hello World"] and *not*
+    # [/bin/sh, -c, echo, "Hello, World"]
+    local SAVEIFS=$IFS # Save current IFS
+    IFS=$'\n'    # Change IFS to new line
+    local ENV=($(echo "$config" | jq --raw-output 'try .Env[]'))
+    local CMD=($(echo "$config" | jq --raw-output 'try .Cmd[]'))
+    local ENTRYPOINT=($(echo "$config" | jq --raw-output 'try .Entrypoint[]'))
+    IFS=$SAVEIFS # Restore IFS
+
+    # If the ENTRYPOINT/CMD is /sbin/init we will just use that, because init
+    # systems like systemd will set the hostname and mount /proc themselves.
+    if [[ "${ENTRYPOINT[@]}" == "/sbin/init" ]]; then
+        echo "ENTRYPOINT is /sbin/init, using that"
+    elif [[ "${#ENTRYPOINT[@]}" == 0 && "${CMD[@]}" == "/sbin/init" ]]; then
+        echo "CMD is /sbin/init, using that"
+    else
+        # If /sbin/init is not specified, we create a simple init script
+        # to set the env, hostname, workir, mount /proc and exec the actual
+        # ENTRYPOINT, noting the use of exec as we want that command and not
+        # our init-entrypoint script as PID 1 in the Firecracker MicroVM guest.
+
+        # The init-entrypoint that we will generate here to init the guest to
+        # the ENTRYPOINT specified by the container image is currently a simple
+        # shell script, so requires /bin/sh to run and /bin/hostname to
+        # initialise the guest's hostname. If those are not present in
+        # the rootfs, we download and install the executables from busybox.
+        # TODO In due course it might be worth creating an init-entrypoint that
+        # is a standalone static executable to better support scratch images.
+        check_and_install $rootfs /bin/sh
+        check_and_install $rootfs /bin/hostname
+        check_and_install $rootfs /bin/cat
+        check_and_install $rootfs /bin/mount
+
+
+        local shell="#!/bin/sh\n"
+        # Set ENV vars for init script
+        local env=""
+        for entry in "${ENV[@]}"; do env="${env}export \"${entry}\"\n"; done
+        # Set init to source the file we will use for injecting ENV vars at
+        # run-time via Docker's -e/--env flags (if it exists).
+        env="${env}[ -f /etc/profile.d/01-container-env-vars.sh ] && . /etc/profile.d/01-container-env-vars.sh\n"
+
+        # Set hostname, WORKDIR, and mount /proc for the init script,
+        # and make sure /tmp has the correct 1777 permissions
+        local misc="hostname "'$(cat /etc/hostname)'"\n[ -d /proc ] && mount -t proc proc /proc\n[ -d /tmp ] && chmod 1777 /tmp \ncd $workdir\n"
+
+        # Set ENTRYPOINT for init script. This also extracts any command
+        # line args for init that are packed into the INIT_ARGS env var
+        # by firestarter in lieu of being properly set in the boot parameters.
+        local entrypoint=""
+        for entry in "${ENTRYPOINT[@]}"; do
+            entrypoint="${entrypoint} "'\"'"${entry}"'\"'""
+        done
+
+        local cmd=""
+        for entry in "${CMD[@]}"; do
+            cmd="${cmd} "'\"'"${entry}"'\"'""
+        done
+
+        local execute="# Transform the INIT_ARGS env var into "real" args\n"
+        if [[ "${#ENTRYPOINT[@]}" == 0 ]]; then
+            execute="${execute}"'eval "set -- $INIT_ARGS"\n# After converting into "real" args remove INIT_ARGS from the environment\nunset INIT_ARGS\n# If any args have been passed use those, otherwise use CMD\n[ -z "$1" ] && eval "set -- '"${cmd}"'"\n'
+        else
+            execute="${execute}"'eval "set -- '"${entrypoint} ${cmd}"' $INIT_ARGS"\n# After converting into "real" args remove INIT_ARGS from the environment\nunset INIT_ARGS\n'
+        fi
+
+        mkdir -p $rootfs/sbin # Make sure /sbin directory exists
+        echo -e "${shell}${env}${misc}${execute}exec "'"$@"' > $rootfs/sbin/init-entrypoint
+        chmod 755 $rootfs/sbin/init-entrypoint
+    fi
+}
+
+
+# This function is (roughly) equivalent way to docker pull.
+# It first parses the supplied image name to recover the
+# registry URL, normalised image name and tag. Next it gets
+# the bearer authentication token that is required to get the
+# image manifest. With the manifest retrieved it may be used
+# to find the IDs (digests) of the image layers, which are
+# then pulled and unpacked into our root filesystem.
+docker_pull() {
+    local -n image=$1 # N.B. Passed *by reference*
+    local rootfs=$2
+
+    # Convert returned value into array to use like a tuple
+    local parsed_image_name=($(parse_image_name $image))
+    local registry_URL=${parsed_image_name[0]}
+    image=${parsed_image_name[1]}
+    local tag=${parsed_image_name[2]}
+
+    #echo "registry_URL: $registry_URL"
+    #echo "image: $image"
+    #echo "tag: $tag"
+
+    echo "Using $([[ $tag == "latest" ]] && echo "default") tag: $tag"
+    echo "$tag: Pulling from $image"
+
+    # Get the Docker Hub bearer authentication token needed to pull image.
+    # Note that this won't be valid for private registries that use bearer token
+    local token=$(get_dockerhub_auth_token)
+
+    # Get the image manifest from the registry
+    # https://docs.docker.com/registry/spec/manifest-v2-2/
+    local manifest=$(get_manifest $registry_URL $token $image $tag)
+    [[ $manifest == "" ]] && exit 1
+    #echo $manifest
+
+    # Get the image config from the manifest. There doesn't
+    # seem to be a document for this, but it's basically the
+    # same as the OCI image configuration schema.
+    # https://github.com/opencontainers/image-spec/blob/main/config.md
+    local config=$(echo "$manifest" | jq --raw-output .config.digest)
+    config=$(get_blob $registry_URL $token $image $config)
+    [[ $config == "" ]] && exit 1
+
+    #echo $config > config.json # Raw JSON
+    #echo $config | jq --raw-output . > config.json # Pretty print with jq
+
+    # Get the layers from the manifest
+    local layers=$(echo "$manifest" | jq --raw-output .layers[])
+    local layer_digests=$(echo "$layers" | jq --raw-output .digest)
+    local sizes=$(echo "$layers" | jq --raw-output .size)
+    sizes=(${sizes})  # Get layer sizes as an array
+    #echo $layer_digests
+
+    local unwritable_dirs=() # Used so we can restore original permissions
+    for digest in $layer_digests; do
+        # Convert layer size to MB
+        local layer_size=$(echo "scale=2; (${sizes[0]}+5000)/1000000" | bc)
+        sizes=(${sizes[@]:1}) # Remove first element using sub-arrays
+        echo -en "${digest:7:12}: Downloading ${layer_size}MB"
+        get_blob $registry_URL $token $image $digest | tar -xz -C ${rootfs}
+        echo -en "\r${digest:7:12}: Pull complete        \n"
+
+        unwritable_dirs+=($(chmod_unwritable_dirs "$rootfs"))
+        delete_marked_items "$rootfs"
+    done
+    echo
+
+    generate_init "$rootfs" "$config"
+
+    # If there were any unwritable dirs in the layers that we
+    # needed to make writable in order to unpack the filesysem,
+    # we now restore them back to their original permissions.
+    for item in "${unwritable_dirs[@]}"; do chmod u-w $item; done
+
+    chmod_unreadable_dirs "$rootfs"
+
+    # Return image name without namespace/prefix by reference
+    image=$(echo $image | cut -d"/" -f2)
+}
+
+
+# This function follows a similar approach to our docker_pull
+# though in this case we are unpacking the image archive
+# exposed by doing docker save. We first extract the manifest
+# from the archive and use that to get the names of the config
+# and layers files, which we then use to extract those objects
+# from the image archive. We use tar xOf to extract to stdout
+docker_load() {
+    local -n image=$1 # N.B. Passed *by reference*
+    local rootfs=$2
+    local decompress=""
+    [ -z "${image##*.tar.gz*}" ] && decompress="z"
+    echo "Loading image from from $image"
+
+    # Get the image manifest from the registry. This is
+    # similar, but not identical to the manifest described in: 
+    # https://docs.docker.com/registry/spec/manifest-v2-2/
+    local manifest=$(tar -${decompress}xOf $image manifest.json)
+    #echo $manifest
+
+    # Get the image config from the manifest.
+    local config=$(echo "$manifest" | jq --raw-output .[0].Config)
+    config=$(tar -${decompress}xOf $image $config)
+    [[ $config == "" ]] && exit 1
+
+    #echo $config > config.json # Raw JSON
+    #echo $config | jq --raw-output . > config.json # Pretty print with jq
+
+    # Get the layers from the manifest
+    local layers=$(echo "$manifest" | jq --raw-output .[0].Layers[])
+    #echo $layers
+
+    local unwritable_dirs=() # Used so we can restore original permissions
+    for layer in $layers; do
+        echo -en "${layer:0:12}: Untarring"
+        tar -${decompress}xOf $image $layer | tar -x -C ${rootfs}
+        echo -en "\r${layer:0:12}: Untar complete        \n"
+
+        unwritable_dirs+=($(chmod_unwritable_dirs "$rootfs"))
+        delete_marked_items "$rootfs"
+    done
+    echo
+
+    generate_init "$rootfs" "$config"
+
+    # If there were any unwritable dirs in the layers that we
+    # needed to make writable in order to unpack the filesysem,
+    # we now restore them back to their original permissions.
+    for item in "${unwritable_dirs[@]}"; do chmod u-w $item; done
+
+    chmod_unreadable_dirs "$rootfs"
+
+    # Return image name without extension by reference
+    image=$(echo $image | cut -d"." -f1)
+}
+
+
+# Find the *actual* directory that this script is running from.
+# The motivation for this is because we want to be able to use the
+# Firecracker launcher directory as a "template" for the Dockerfiles
+# that we will be generating for the images being transformed
+# into firecracker-in-docker images, so we need to know where
+# to find the launcher directory even if we're running image-builder
+# from a symlink to it created on our PATH.
+# https://stackoverflow.com/a/246128
+get_script_dir() {
+    local source="${BASH_SOURCE[0]}"
+    # While $source is a symlink, resolve it
+    while [ -h "$source" ]; do
+        local dir="$(cd -P "$(dirname "$source")" && pwd)"
+        source="$(readlink "$source")"
+        # If $source was a relative symlink (so no "/" as prefix),
+        # we need to resolve it relative to the symlink base directory
+        [[ $source != /* ]] && source="$dir/$source"
+    done
+    echo "$(cd -P "$(dirname "$source")" && pwd)"
+}
+
+
+# Generate a directory containing the kernel, root filesystem, and Dockerfile
+# needed to build the firecracker-in-docker image created from the source image.
+generate_firecracker_in_docker() {
+    local image=$1
+    local rootfs=$2
+    template_dir=$(echo "$(get_script_dir)/../launcher")
+    target="firecracker-$image"
+
+    echo "Generating $target"
+
+    mkdir -p $target/rootfs
+    cp -n $template_dir/.dockerignore $target/.dockerignore
+    mv $rootfs $target/rootfs/$rootfs
+    chmod 666 $target/rootfs/$rootfs
+
+    if [ ! -f $target/Dockerfile ]; then
+        if [ -z ${3+x} ]; then
+            # If we're creating a standalone Dockerfile we copy the kernel
+            # and firestarter ENTRYPOINT, then copy the template Dockerfile
+            # from the launcher Directory and modify it to COPY rootfs.ext4
+            # into the image.
+            mkdir -p $target/kernel $target/resources
+            if [ -f $template_dir/kernel/vmlinux ]; then
+                cp $template_dir/kernel/vmlinux $target/kernel/vmlinux
+            else
+                echo "Error: generating $target failed, could not find $template_dir/kernel/vmlinux"
+                exit 1
+            fi
+            # -n "no clobber" copy (e.g. copy but don't overwrite)
+            cp -n $template_dir/resources/firestarter $target/resources/firestarter
+            cp -n $template_dir/Dockerfile $target/Dockerfile
+            sed -i "s/\/usr\/local\/bin\/vmlinux/\/usr\/local\/bin\/vmlinux\nCOPY rootfs\/rootfs.ext4 \/usr\/local\/bin\/rootfs.ext4/g" $target/Dockerfile
+            sed -i "s/firecracker-in-docker/$target/g" $target/Dockerfile
+        else
+            # If we've specified a base image we generate a new Dockerfile to
+            # specify the base image and COPY the rootfs.ext4 into the image.
+            local base=$3
+cat <<EOF > $target/Dockerfile
+#
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+# 
+#   http://www.apache.org/licenses/LICENSE-2.0
+# 
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+
+FROM $base
+
+COPY rootfs/rootfs.ext4 /usr/local/bin/rootfs.ext4
+
+#-------------------------------------------------------------------------------
+# 
+# To build the image
+# docker build -t $target .
+#
+
+EOF
+        fi
+    fi
+
+    if [ ! -f $target/$target ]; then
+        cp $template_dir/firecracker $target/$target
+        sed -i "s/firecracker-in-docker/$target/g" $target/$target
+    fi
+
+    if [ ! -f $target/README.md ]; then
+cat <<EOF > $target/README.md
+# $target launcher
+This directory was generated by image-builder and contains the Dockerfile and resources required to build and run the $target firecracker-in-docker image.
+
+## Usage
+To build the $target image run:
+\`\`\`
+docker build -t $target .
+\`\`\`
+To run the container:
+\`\`\`
+./$target
+\`\`\`
+
+EOF
+    fi
+}
+
+
+usage() {
+cat <<EOF
+Usage: $(basename $0) [-h --help] [-b --base=<image>] [-s --size=size] <name>
+    -h, --help         display this usage message
+    -b, --base=<image> use <image> as base image of generated Dockerfile.
+                       Defaults to firecracker-in-docker if <image> isn't
+                       specified and generates a standalone Dockerfile if
+                       the -b option isn't specified at all.
+    -s, --size=size    specify root filesystem size. If not specified the
+                       root filesystem is automatically minimised, if set
+                       the size units are interpreted in same way as mke2fs
+                       with 'k', 'm', 'g', 't' upper or lower case suffixes.
+EOF
+}
+
+
+# Initialise variables to default values
+IMAGE="hello-world"
+SIZE=0
+MOUNTPOINT=rootfs
+FILESYSTEM=rootfs.ext4
+
+
+# Parse the command line arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -h|--help)
+            usage
+            exit 1
+            ;;
+        -b|--base)
+            if [ $# -eq 2 ] || [[ $2 == -* ]]; then
+                BASE="firecracker-in-docker"
+                shift # past argument
+            else
+                BASE="$2"
+                shift # past argument
+                shift # past value
+            fi
+            ;;
+        -b=*|--base=*)
+            BASE="${1#*=}"
+            shift # past argument=value
+            ;;
+        -s|--size)
+            if [ $# -lt 3 ] || [[ $2 == -* ]]; then
+                echo "size option requires a value."
+                exit 1
+            fi
+                
+            SIZE="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        -s=*|--size=*)
+            SIZE="${1#*=}"
+            shift # past argument=value
+            ;;
+        *)
+            # unknown option
+            [[ $1 != -* ]] && IMAGE=$1
+            shift # past value
+            ;;
+    esac
+done
+
+
+# Create a directory to unpack our filesystem from the image
+mkdir -p $MOUNTPOINT
+
+# N.B. the IMAGE variable is passed *by reference* below
+# https://www.gnu.org/software/bash/manual/html_node/Shell-Parameters.html
+# so after calling the docker_load or docker_pull function it will be
+# populated with the basic image name, which will then be used to
+# generate the firecracker-in-docker directory for the image being built.
+if [ -z "${IMAGE##*.tar*}" ]; then
+    docker_load IMAGE $MOUNTPOINT
+else
+    docker_pull IMAGE $MOUNTPOINT
+fi
+
+
+# With regular Docker containers the container’s writable layer will simply
+# grow until the underlying filesystem limits are reached, but a MicroVM
+# requires its own filesystem which needs to be set to a specific size.
+#
+# At build time the image-builder, by default, deliberately shrinks the
+# MicroVM root filesystem to contain only those blocks that are actually 
+# used in order to minimise image size. If the -s option is used, then the
+# user may specify a particular filesystem size to use, in which case
+# image-builder will use that size rather than shrinking, which is likely
+# to result in a larger overall image size.
+
+if [ $SIZE -eq 0 ]; then
+    # Estimate required minimum rootfs size (disk usage + 20%)
+    # The du -shm command returns summarised directory size in MB
+    FILESYSTEM_SIZE=$(du -shm $MOUNTPOINT | grep -o '[0-9]*' | head -1)
+    FILESYSTEM_SIZE="$((FILESYSTEM_SIZE + (FILESYSTEM_SIZE / 5)))M"
+    echo "Estimated filesystem size: ${FILESYSTEM_SIZE}"
+else
+    FILESYSTEM_SIZE=$SIZE
+    echo "Requested filesystem size: ${FILESYSTEM_SIZE}"
+fi
+
+# Create filesystem from directory contents using mkfs.ext4
+# Use fakeroot to ensure filesystem has root:root ownership
+# https://manpages.debian.org/buster/fakeroot/fakeroot.1.en.html
+# https://man7.org/linux/man-pages/man8/mke2fs.8.html
+rm -f $FILESYSTEM
+set +e # Temporarily disable exit on error to ensure mountpoint tidy up happens
+fakeroot sh -c "mkfs.ext4 -L '' -N 0 -d ${MOUNTPOINT} -m 5 -r 1 ${FILESYSTEM} ${FILESYSTEM_SIZE}"
+if [ $? -eq 0 ]; then
+    if [[ $SIZE == "0" ]]; then # If user hasn't specified a size try to minify
+        # If we successfully create the filesystem using the estimated
+        # size, next get the *actual* number of blocks that were created
+        # and resize to that. The output of e2fsck will be of the form:
+        # rootfs.ext4: clean, 29955/74240 files, 260774/296704 blocks
+        # so we parse into an array and blocks will be the 4th entry. 
+        FSCK_RESULTS=($(e2fsck -n $FILESYSTEM))
+        BLOCKS=$(echo ${FSCK_RESULTS[4]} | cut -d"/" -f1)
+
+        # Shrink the root filesystem to minimise the final image size.
+        resize2fs -f $FILESYSTEM $BLOCKS
+    fi
+else
+    echo "Error: creating rootfs failed"
+    rm -f $FILESYSTEM
+fi
+set -e # Re-enable exit on error
+
+# Make unwritable directories writable, so that we may remove the temporary
+# directory that was used to unpack our filesystem from the image.
+chmod_unwritable_dirs "$MOUNTPOINT" > /dev/null
+rm -rf $MOUNTPOINT
+
+# Generate the directory containing everything needed to build the image
+if [ -z ${BASE+x} ]; then
+    generate_firecracker_in_docker $IMAGE $FILESYSTEM
+else
+    generate_firecracker_in_docker $IMAGE $FILESYSTEM $BASE
+fi
+
