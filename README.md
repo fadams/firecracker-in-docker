@@ -17,7 +17,7 @@ There are several other projects with a similar goal, most notably [Kata Contain
 
 There are pros and cons to both approaches. With Kata Containers and firecracker-containerd container deployment is arguably more *transparent*, whereas with firecracker-in-docker the source image requires an explicit  *transformation* step. Conversely, our approach is simpler, has fewer "moving parts", uses a standard container runtime and the run time images are stand-alone and more easily customisable.
 
-With firecracker-in-docker the available guest attack surface is arguably lower than with Kata Containers and firecracker-containerd. Both of those run a guest image that comprises, in addition to the application container image, a container engine and an agent that communicates with the host. Conversely, firecracker-in-docker behaves much more like a Unikernel, where we boot the kernel then init directly to the binary specified by the container ENTRYPOINT+CMD from the image that we have converted to the Firecracker rootfs. If that image is a minimal image built off [scratch](https://docs.docker.com/develop/develop-images/baseimages/#create-a-simple-parent-image-using-scratch) then we are very close indeed to operating like a Unikernel. Moreover, we could customise further to create bespoke kernels, for example for applications that do not require network support we could build a kernel with no network stack and communicate with the guest via virtio-serial.
+With firecracker-in-docker the available guest attack surface is arguably lower than with Kata Containers and firecracker-containerd. Both of those run a guest image that comprises, in addition to the application container image, a container engine and an agent that communicates with the host. Conversely, firecracker-in-docker behaves much more like a Unikernel, where we boot the kernel then init directly to the binary specified by the container ENTRYPOINT+CMD from the image that we have converted to the Firecracker rootfs. If that image is a minimal image built off [scratch](https://docs.docker.com/develop/develop-images/baseimages/#create-a-simple-parent-image-using-scratch) then we are very close indeed to operating like a Unikernel. Moreover, we could customise further to create bespoke kernels, for example for applications that do not require network support we could build a kernel with no network stack and communicate with the guest via [virtio-vsock](https://github.com/firecracker-microvm/firecracker/blob/main/docs/vsock.md).
 
 ## Prerequisites
 Although a goal of this project is to be able to run [Firecracker](https://github.com/firecracker-microvm/firecracker) MicroVMs inside *unprivileged* Docker containers, to achieve that there are some prerequisites.
@@ -41,11 +41,11 @@ KVM acceleration can be used
 ```
 To install the essential KVM packages on a Debian or Ubuntu based system run the following command:
 ```
-sudo apt install qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils
+sudo apt install -y qemu-kvm libvirt-daemon-system libvirt-clients bridge-utils
 ```
 alternatively, to install a more complete set of QEMU/KVM packages run the following command:
 ```
-$ sudo apt install -y qemu qemu-kvm libvirt-daemon libvirt-clients bridge-utils virt-manager
+sudo apt install -y qemu qemu-kvm libvirt-daemon libvirt-clients bridge-utils virt-manager
 ```
 As only members of the kvm and libvirt groups can run Virtual Machines it may be necessary to add those (replacing [username] with the actual username):
 ```
@@ -92,7 +92,7 @@ At startup the firecracker-in-docker ENTRYPOINT ([firestarter](launcher/resource
 ### Build a kernel
 To begin working with Firecracker an appropriately configured Linux kernel is required. The best way to obtain a kernel is to follow the instructions in the [kernel-builder](kernel-builder) section of this repository, which provides a Docker based kernel build system.
 
-Alternatively, the [stock v4.14.174 kernel](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin) linked in the [Firecracker getting started guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#running-firecracker) may be downloaded and copied to [launcher/kernel/vmlinux](launcher/kernel/vmlinux). Using the stock kernel is not recommended however, as it is a little old and doesn't support the `random.trust_cpu=on` kernel option, which can cause startup issues with some applications due to low entropy on VM start up.
+Alternatively, the [stock v4.14.174 kernel](https://s3.amazonaws.com/spec.ccfc.min/img/quickstart_guide/x86_64/kernels/vmlinux.bin) linked in the [Firecracker getting started guide](https://github.com/firecracker-microvm/firecracker/blob/main/docs/getting-started.md#running-firecracker) may be downloaded and copied to [launcher/kernel](launcher/kernel)/vmlinux. Using the stock kernel is not recommended however, as it is a little old and doesn't support the `random.trust_cpu=on` kernel option, which can cause [startup issues](https://lwn.net/Articles/693189/) with some applications due to low entropy on VM start up.
 
 ### Learn how it works
 Once a kernel has been obtained it is recommended, though not essential, to read the [Firecracker rootfs tutorial](firecracker-rootfs-tutorial) to understand the approach used by firecracker-in-docker for converting Docker images into an equivalent Firecracker root filesystem as an unprivileged user.
@@ -116,14 +116,14 @@ It is important to note from the [Firecracker Charter](https://github.com/firecr
 [Host filesystem sharing](https://github.com/firecracker-microvm/firecracker/issues/1180) is not currently supported by Firecracker (and might never be) as the [attack surface implications are large](https://github.com/firecracker-microvm/firecracker/pull/1351#issuecomment-667085798).
 
 - TODO - It is possible to provide *limited* support in the form of passing read-only "snapshots" of mounted volumes to the guest filesystem at startup. This should be relatively simple to implement using the same approach currently used to pass run-time environment variables and is likely a good approach for things like secrets and configuration.
-- TODO -Using something like [NFS](https://en.wikipedia.org/wiki/Network_File_System) should be possible as a work-around. This is basically what AWS does with [Fargate](https://aws.amazon.com/fargate/) where Fargate [added support for EFS](https://aws.amazon.com/blogs/aws/new-aws-fargate-for-amazon-eks-now-supports-amazon-efs/), which is basically a managed NFS service.
+- TODO - Using something like [NFS](https://en.wikipedia.org/wiki/Network_File_System) should be possible as a work-around. This is what AWS does with [Fargate](https://aws.amazon.com/fargate/), where it [added support for EFS](https://aws.amazon.com/blogs/aws/new-aws-fargate-for-amazon-eks-now-supports-amazon-efs/), which is basically a managed NFS service.
 
 ### Ephemeral storage may require configuration
-With regular Docker containers the container's writable layer will simply grow until the underlying filesystem limits are reached, but a MicroVM requires its own filesystem which needs to be set to a specific size.
+With regular Docker containers the container's writable layer will simply grow until the underlying host filesystem limits are reached, but a MicroVM requires its own filesystem which needs to be set to a specific size.
 
-At build time the [image-builder](image-builder), by default, deliberately shrinks the MicroVM root filesystem to contain only those blocks that are actually used in order to minimise image size. At run-time we therefore resize the root filesystem to a more useful size based on the FC_EPHEMERAL_STORAGE environment variable setting.
+At build time the [image-builder](image-builder), by default, deliberately shrinks the MicroVM root filesystem to contain only those blocks that are actually used in order to minimise image size. At run-time, we therefore resize the root filesystem to a more useful size based on the FC_EPHEMERAL_STORAGE environment variable setting.
 
-If FC_EPHEMERAL_STORAGE is unset, the default is to resize the root filesystem to double its minimised size. If it is set to a value greater than zero then the root filesystem will be resized to the specified size, as interpreted by [resize2fs](https://man7.org/linux/man-pages/man8/resize2fs.8.html). If no units are specified, the units of the size parameter shall be the file system blocksize of the file system. Optionally, the size parameter may be suffixed by one of the following units designators: 'K', 'M', 'G', 'T' (either upper-case or lower-case) or 's' for power-of-two kilobytes, megabytes, gigabytes, terabytes or 512 byte sectors respectively. If set to zero  then the root filesystem will not be resized.
+If FC_EPHEMERAL_STORAGE is unset, the default strategy is to resize the root filesystem to double its minimised size. If it is set to a value greater than zero then the root filesystem will be resized to the specified size, as interpreted by [resize2fs](https://man7.org/linux/man-pages/man8/resize2fs.8.html). If no units are specified, the units of the size parameter shall be the file system blocksize of the file system. Optionally, the size parameter may be suffixed by one of the following units designators: 'K', 'M', 'G', 'T' (either upper-case or lower-case) or 's' for power-of-two kilobytes, megabytes, gigabytes, terabytes or 512 byte sectors respectively. If set to zero  then the root filesystem will not be resized.
 
 ### Limited device support
 Firecracker, by design, supports only a limited set of devices.
@@ -132,8 +132,10 @@ Firecracker, by design, supports only a limited set of devices.
 - [i8254](https://wiki.osdev.org/Programmable_Interval_Timer) Programmable Interval Timer (emulated in-kernel by KVM)
 - [i8042](https://wiki.osdev.org/%228042%22_PS/2_Controller) PS/2 Keyboard and Mouse Controller (emulated by Firecracker only as a minimal ctrl_alt_del handler in [devices/src/legacy/i8042.rs](https://github.com/firecracker-microvm/firecracker/blob/main/src/devices/src/legacy/i8042.rs))
 - Serial console (emulated by Firecracker in [devices/src/legacy/serial.rs](https://github.com/firecracker-microvm/firecracker/blob/main/src/devices/src/legacy/serial.rs))
-- VirtIO Block (emulated by Firecracker in [devices/src/virtio/block](https://github.com/firecracker-microvm/firecracker/tree/main/src/devices/src/virtio/block))
-- VirtIO Net (emulated by Firecracker in [devices/src/virtio/net.rs](https://github.com/firecracker-microvm/firecracker/tree/main/src/devices/src/virtio/net))
+- virtio-block (emulated by Firecracker in [devices/src/virtio/block](https://github.com/firecracker-microvm/firecracker/tree/main/src/devices/src/virtio/block))
+- virtio-net (emulated by Firecracker in [devices/src/virtio/net](https://github.com/firecracker-microvm/firecracker/tree/main/src/devices/src/virtio/net))
+- virtio-vsock (emulated by Firecracker in [devices/src/virtio/vsock](https://github.com/firecracker-microvm/firecracker/tree/main/src/devices/src/virtio/vsock))
+- virtio-balloon (emulated by Firecracker in [devices/src/virtio/balloon](https://github.com/firecracker-microvm/firecracker/tree/main/src/devices/src/virtio/balloon))
 - TODO - It *might* be possible to support some [hardware acceleration](https://blog.cloudkernels.net/posts/vaccel/) in the future, for example with this [vAccel-virtio](https://blog.cloudkernels.net/posts/vaccel_v2/) approach from [vAccel](https://vaccel.org/), though this is currently a work in progress.
 
 ### Limited IPC sharing
@@ -175,12 +177,12 @@ With Docker, it is common to create base images and then extend those. However, 
 
 It should be remembered, however, that the that the **primary** use case for Firecracker is to provide secure, multi-tenant execution of workloads. In general "traditional" distribution base images (even minimal ones like Alpine) include far more binaries and libraries than are *actually* required to run the application and when images are extended the additional package dependencies tend to exacerbate that situation further.
 
-Therefore, rather than being seem as a limitation, the fact that firecracker-in-docker basically creates a "flattened" filesystem is actually an advantage from a security perspective. The best way to build images is really to use multi-stage builds, preferably with the final stage being built using the [scratch](https://docs.docker.com/develop/develop-images/baseimages/#create-a-simple-parent-image-using-scratch) base image, and preferably following the [microcontainers](https://blogs.oracle.com/developers/post/the-microcontainer-manifesto-and-the-right-tool-for-the-job) philosophy. By creating an image that includes only the application binary and the shared libraries it *actually* requires one can significantly reduce the potential user space attack surface available in the Firecracker guest VM.
+Therefore, rather than being seen as a limitation, the fact that firecracker-in-docker basically creates a "flattened" filesystem is actually an advantage from a security perspective. The best way to build images is really to use multi-stage builds, preferably with the final stage being built using the [scratch](https://docs.docker.com/develop/develop-images/baseimages/#create-a-simple-parent-image-using-scratch) base image, and preferably following the [microcontainers](https://blogs.oracle.com/developers/post/the-microcontainer-manifesto-and-the-right-tool-for-the-job) philosophy. By creating an image that includes only the application binary and the shared libraries it *actually* requires, one can significantly reduce the potential user space attack surface available in the Firecracker guest VM.
 
 ### MicroVM termination is currently not very clean
 Currently, signals are not particularly well handled nor propagated to the guest VM. In simple terms this means that, when a firecracker-in-docker container is stopped, the MicroVM is killed somewhat uncleanly. This is basically the equivalent of stopping everything with SIGKILL and can have some implications for applications.
 
-One example is where a client application has connected to a RabbitMQ queue requesting exclusive access. In that scenario the broker prevents other applications connecting to the same queue, however, if the client is killed uncleanly the broker won't immediately release its lock. If the application is restarted it is likely to see an error like: 
+One example is where a client application has connected to a RabbitMQ queue requesting [exclusive access](https://www.rabbitmq.com/consumers.html#exclusivity). In that scenario the broker prevents other consumers connecting to the same queue, however, if the client is then killed uncleanly the broker won't immediately release its lock. If the application is restarted it is likely to see an error like: 
 ```
 ACCESS_REFUSED - queue 'xxx' in vhost '/' in exclusive use
 ```

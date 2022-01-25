@@ -2,13 +2,15 @@
 This directory provides [image-builder](image-builder), a tool to transform regular Docker images into a root filesystem for Firecracker and a directory containing the kernel, root filesystem, and Dockerfile needed to build the firecracker-in-docker image created from the source image.
 
 ## Implementation Details
-### Unpack image to create root filesystem contents
+The following steps are performed by the image-builder.
+
+### Fetch and unpack image to create root filesystem
 The image-builder tool is derived from the [image2fs](../firecracker-rootfs-tutorial/image2fs) example from the [firecracker-rootfs-tutorial](../firecracker-rootfs-tutorial). The majority of the code used to actually generate the root filesystem is identical to that example and described in detail in the firecracker-rootfs-tutorial, so won't be repeated here.
 
 ### Generate init
 Once the basic root filesystem has been created, in most cases we next need to generate a simple init system for the Firecracker MicroVM guest to use.
 
-On Linux and other Unix based operating systems init is the first user process started by the kernel during the booting process. Init is a daemon process that continues running until the system is shut down and is typically assigned process identifier 1 (PID 1).
+On Linux and other Unix based operating systems init is the first user process started by the kernel during the boot process. Init is a daemon process that continues running until the system is shut down and is typically assigned process identifier 1 (PID 1).
 
 With Docker, containers use [Linux namespaces](https://en.wikipedia.org/wiki/Linux_namespaces) as one of the isolation mechanisms. [PID namespaces](https://man7.org/linux/man-pages/man7/pid_namespaces.7.html) isolate the process ID number space, meaning that processes in different PID namespaces can have the same PID. Moreover, PIDs in a new PID namespace start at 1 meaning that running Docker containers spawns processes beginning with PID 1, so the ENTRYPOINT of a container will be its PID 1 process.
 
@@ -230,7 +232,7 @@ cp -n $template_dir/.dockerignore $target/.dockerignore
 mv $rootfs $target/rootfs/$rootfs
 chmod 666 $target/rootfs/$rootfs
 ```
-We next check whether a Dockerfile already exists in the target directory. If not be then check if the user has specified generating a "standalone" Dockerfile or one based on a firecracker-in-docker base image.
+We next check whether a Dockerfile already exists in the target directory. If not we then check if the user has specified generating a "standalone" Dockerfile or one based on a firecracker-in-docker base image.
 
 If we're creating a standalone Dockerfile we copy the kernel and firestarter ENTRYPOINT, then copy the template Dockerfile from the launcher Directory and modify it (using sed) to COPY rootfs.ext4 into the image.
 ```

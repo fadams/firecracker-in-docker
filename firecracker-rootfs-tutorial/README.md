@@ -4,7 +4,7 @@ This directory contains a tutorial to help users understand the process for buil
 
 ## Tutorial
 ### Introduction
-There are many different ways to create a Linux root filesystem, but as the ultimate goal of this repository is to allow us to transform existing Docker images into the equivalent firecracker-in-docker images the focus of this tutorial shall be on explaining a number of different approaches for creating a rootfs image from a Docker image.
+There are many different ways to create a Linux root filesystem, but as the ultimate goal of this repository is to allow us to transform existing Docker images into equivalent firecracker-in-docker images the focus of this tutorial shall be on explaining a number of different approaches for creating a rootfs image from a Docker image.
 
 To that end, for the purpose of this tutorial we shall use the following example Dockerfile [Dockerfile-focal-demo](Dockerfile-focal-demo), which is a a simple Ubuntu based image that contains a few network applications and the systemd init system, which is unusual in a Docker application, but useful when getting started with Firecracker.
 ```
@@ -29,7 +29,7 @@ to build the image use:
 docker build -t focal-demo -f ./Dockerfile-focal-demo .
 ```
 ### Usage
-All of the following rootfs creation approaches will use this focal-demo example as a source image and will create a rootfs.ext4 file, which is the Firecracker root filesystem, as an output. To use this root filesystem, it should be copied into the [rootfs](../launcher/rootfs) subdirectory of the [launcher](../launcher) directory. After building the firecracker-in-docker image using the [Dockerfile](../launcher/Dockerfile) in that directory the example may then be run by running the `firecracker` script in the launcher directory.
+All of the following rootfs creation approaches will use this focal-demo example as a source image and will create a `rootfs.ext4` file, which is the Firecracker root filesystem, as an output. To use this root filesystem, it should be copied into the [rootfs](../launcher/rootfs) subdirectory of the [launcher](../launcher) directory. After building the firecracker-in-docker image using the [Dockerfile](../launcher/Dockerfile) in that directory the example may then be run by running the [firecracker](../launcher/firecracker) script in the launcher directory.
 
 Note that this approach is primarily intended as a tutorial to help users understand the mechanics of creating a Firecracker root filesystem from a Docker image. For more serious usage, users are pointed to the [image-builder](../image-builder), and the [examples](../examples) directory which uses the image-builder.
 
@@ -59,7 +59,7 @@ docker run -d focal-demo /bin/bash
 ```
 `docker run` will report the container id, which should be used in the following command used to export the container's filesystem to our mountpoint:
 ```
-docker export <container ID returned from previous docker run>| sudo tar xp -C rootfs
+docker export <container ID returned from previous docker run> | sudo tar xp -C rootfs
 ```
 Finally, we unmount:
 ```
@@ -69,7 +69,7 @@ then tidy up the mountpoint
 ```
 rm -rf rootfs
 ```
-then the container:
+then remove the container:
 ```
 docker rm <container ID returned from previous docker run>
 ```
@@ -291,7 +291,7 @@ get_manifest() {
   fi
 }
 ```
-This function simply uses `curl` to retrieve the manifest, however using the default query to the URL will return the old v1 manifest so we add Accept headers to request the v2 manifest if available. Another point of note is that some images may have variants for different platforms (amd64, arm64 etc.). To account for this we first query the [manifest list](https://docs.docker.com/registry/spec/manifest-v2-2/#manifest-list) and if that is returned we select the digest from the linux+amd64 version and use that to do a second `get_manifest` call.
+This function simply uses `curl` to retrieve the manifest, however using the default query to the URL will return the old v1 manifest so we add `Accept` headers to request the v2 manifest if available. Another point of note is that some images may have variants for different platforms (amd64, arm64 etc.). To account for this we first query the [manifest list](https://docs.docker.com/registry/spec/manifest-v2-2/#manifest-list) and if that is returned we select the digest from the linux+amd64 version and use that to do a second `get_manifest` call.
 
 Another point of note here is the `curl_ca_verification` call. This tells curl to *not* verify the peer. It is included to account for the case that simple private registries using the `registry:2` image are often set up to use self-signed certificates. Rather that setting curl's `--insecure` flag as we do here, a more secure option is to use `--cacert [file]`to point to the required certificate location, or add the CA cert for your registry to the existing default CA certificate store e.g. /etc/ssl/certs.
 
@@ -351,7 +351,7 @@ delete_marked_items() {
   done
 }
 ```
-The `unwritable_dirs` array and `chmod_unwritable_dirs` call are interesting too. The issue is that some images might have made some directories unwritable, which wouldn't be an issue if we were untarring image layers as root, but because we want to run as an unprivileged user we must find any unwritable directories and make them writable otherwise untarring subsequent layers will fail with a permission error:
+The `unwritable_dirs` array and the `chmod_unwritable_dirs` function are interesting too. The issue is that some images might have made some directories unwritable, which wouldn't be an issue if we were untarring image layers as root, but because we want to run as an unprivileged user we must find any unwritable directories and make them writable otherwise untarring subsequent layers will fail with a permission error:
 ```
 chmod_unwritable_dirs() {
   local rootfs=$1
@@ -365,7 +365,7 @@ However, we also want to make those directories unwritable again in our rootfs a
 ```
 for item in "${unwritable_dirs[@]}"; do chmod u-w $item; done
 ```
-The procedure for extracting the manifest, configuration and layers from a tarred image file obtained from `docker save` is very similar to that followed when pulling an image from a registry, though obviously we are extracting with tar rather than using curl to pull from a URI.
+The procedure for extracting the manifest, configuration, and layers from a tarred image file obtained from `docker save` is very similar to that followed when pulling an image from a registry, though obviously we are extracting with tar rather than using curl to pull from a URI.
 ```
 docker_load() {
   local image=$1

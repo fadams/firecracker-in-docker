@@ -171,7 +171,7 @@ The `random.trust_cpu=on` option is more interesting. The reason for this is bec
 ```
 cat /proc/sys/kernel/random/entropy_avail
 ```
-Low entropy causes issues (hangs) with applications that need entropy e.g. [Python](https://lwn.net/Articles/693189/ and https://bugs.python.org/issue25420). There is a discussion on the topic in firecracker-microvm [issue 663](https://github.com/firecracker-microvm/firecracker/issues/663) and firecracker-containerd [issue 325](https://github.com/firecracker-microvm/firecracker-containerd/issues/325).
+Low entropy causes issues (hangs due to blocking API calls) with applications that require entropy e.g. Python (as described in https://lwn.net/Articles/693189/) and https://bugs.python.org/issue25420). There is a discussion on the topic in firecracker-microvm [issue 663](https://github.com/firecracker-microvm/firecracker/issues/663) and firecracker-containerd [issue 325](https://github.com/firecracker-microvm/firecracker-containerd/issues/325).
 
 One option to mitigate this is the `random.trust_cpu=on` option (or add RANDOM_TRUST_CPU to the kernel config when compiling). Note however that this is only available for kernels > v4.19, so the stock v4.14.174 kernel referenced in the Firecracker quick start will not benefit and can cause issues for Python applications using that kernel in Firecracker.
 
