@@ -39,7 +39,7 @@ Simply running:
 ```
 ./kernel-builder
 ```
-will create the build directory then download and build the default kernel version (currently 5.10.77).
+will create the build directory then download and build the default kernel version (currently 5.10.93).
 
 Running:
 ```
@@ -68,6 +68,6 @@ cp vmlinux user-namespace-launcher/kernel/vmlinux
 This method builds the kernel entirely in the container's filesystem and exports it via stdout, which is redirected to the vmlinux file. As everything will be lost if anything goes wrong with the download and build, this method of building is not recommended unless it is essential to avoid bind-mounting the build directory.
 
 ## Kernel Versions
-The reason why 5.10.77 is currently the default kernel version used by this repo is simply because, according to the [kernel releases](https://www.kernel.org/category/releases.html) page, 5.10 is the LTS version with the longest projected OEL date (Dec, 2026).
+The reason why 5.10.93 is currently the default kernel version used by this repo is simply because, according to the [kernel releases](https://www.kernel.org/category/releases.html) page, 5.10 is the LTS version with the longest projected OEL date (Dec, 2026).
 
 Another noteworthy point about versions is that versions 5.13 and 5.14 should be avoided (or used with caution). The author noted what *appeared* to be "broken" Garbage Collection in a Python application, leading to eventual OOM. This only manifest itself with kernel versions between 5.13 to 5.14.8 and 5.14.9 and above and 5.15 appear to be OK.

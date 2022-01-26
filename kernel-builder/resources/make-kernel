@@ -18,7 +18,7 @@
 # under the License.
 #
 
-KERNEL_VERSION=5.10.77
+KERNEL_VERSION=5.10.93
 KERNEL_MIRROR=https://mirrors.edge.kernel.org/pub/linux/kernel
 
 INTERACTIVE=false
