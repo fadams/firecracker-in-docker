@@ -572,6 +572,12 @@ EOF
 }
 
 
+# Check that jq has been installed.
+if [ -z $(which jq) ]; then
+    echo "image-builder requires jq, which doesn't appear to be installed on this system."
+    exit 1
+fi
+
 # Initialise variables to default values
 IMAGE="hello-world"
 SIZE=0
