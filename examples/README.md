@@ -57,3 +57,51 @@ To prevent firestarter from attempting to resize a root filesystem that is alrea
 ```
 -e FC_EPHEMERAL_STORAGE=0
 ```
+
+## focal-demo
+For this we will start with the [Dockerfile-focal-demo](Dockerfile-focal-demo) Dockerfile in this examples directory, which we first have to build into the source image in the usual way, e.g.:
+```
+docker build -t focal-demo -f ./Dockerfile-focal-demo .
+```
+Because we've just built the image and it is stored locally we can use [docker save](https://docs.docker.com/engine/reference/commandline/save/), which produces a tarred repository containing all parent layers and other image metadata.
+```
+docker save focal-demo > focal-demo.tar
+```
+We can then use the tarred source image with image-builder:
+```
+image-builder focal-demo.tar
+```
+This will read the tarred image, unpack the layers, then generate a root filesystem. It will then create a firecracker-focal-demo directory containing the standalone Dockerfile, kernel, root filesystem etc.
+
+if we:
+```
+cd firecracker-focal-demo
+```
+then:
+```
+docker build -t firecracker-focal-demo .
+```
+that will hopefully result in our firecracker-focal-demo image being created, which may then be run as follows:
+```
+./firecracker-focal-demo
+```
+This example is slightly more interesting than the previous hello-world, giving us a shell on a Firecracker MicroVM. Note that the hostname of the MicroVM has been set to the container's hostname plus a `-firecracker`suffix, though in general we shouldn't need to care about that as all networking goes via the container hosting the MicroVM and is transparently port forwarded.
+
+As mentioned in the [Limitations](https://github.com/fadams/firecracker-in-docker#limitations) section, [running interactively is not transparent](https://github.com/fadams/firecracker-in-docker#running-interactively-is-not-transparent). That is to say using the `-it` flag of `docker run` does not transparently propagate to the guest. This may be seen in this example where the following message is reported on startup:
+```
+bash: cannot set terminal process group (-1): Inappropriate ioctl for device
+bash: no job control in this shell
+```
+and running the `tty` command in the shell reports:
+```
+not a tty
+```
+To attach a TTY and enable job control the following command may be run:
+```
+exec /sbin/agetty --autologin root ttyS0
+```
+If we run:
+```
+ping google.com
+```
+We should see replies, assuming that networking is available on the host and that ICMP hasn't been blocked by a hosting provider or corporate VPN.

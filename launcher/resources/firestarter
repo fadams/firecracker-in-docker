@@ -74,6 +74,16 @@ fi
 KERNEL_IMAGE_PATH="/usr/local/bin/vmlinux"
 ROOTFS="/usr/local/bin/rootfs.ext4"
 
+# Check the Firecracker kernel and root filesystem are present
+if [ ! -f $KERNEL_IMAGE_PATH ]; then
+    echo "Kernel cannot be found, exiting!"
+    exit 1
+fi
+
+if [ ! -f $ROOTFS ]; then
+    echo "Root filesystem cannot be found, exiting!"
+    exit 1
+fi
 
 # Resize the root filesystem based on the FC_EPHEMERAL_STORAGE settings.
 # The firecracker-in-docker images mages created by image-builder are built
