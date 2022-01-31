@@ -141,7 +141,7 @@ chmod_unwritable_dirs() {
 
 
 # With some images some files (most notably shadow and gshadow) get
-# set unreaable even by the owner. This is usually mod 000 and usually
+# set unreadable even by the owner. This is usually mod 000 and usually
 # the shadow/gshadow files. The idea behind setting /etc/shadow permissions
 # to 000 is to protect it from being accessed by daemons, even when running
 # as root, by ensuring that access is controlled by the DAC_OVERRIDE capability.
@@ -360,7 +360,8 @@ docker_pull() {
         local layer_size=$(echo "scale=2; (${sizes[0]}+5000)/1000000" | bc)
         sizes=(${sizes[@]:1}) # Remove first element using sub-arrays
         echo -en "${digest:7:12}: Downloading ${layer_size}MB"
-        get_blob $registry_URL $token $image $digest | tar -xz -C ${rootfs}
+        # Use fakeroot to "wrap" tar to minimise potential permission issues.
+        get_blob $registry_URL $token $image $digest | fakeroot -- tar -xz -C ${rootfs}
         echo -en "\r${digest:7:12}: Pull complete        \n"
 
         unwritable_dirs+=($(chmod_unwritable_dirs "$rootfs"))
@@ -416,7 +417,8 @@ docker_load() {
     local unwritable_dirs=() # Used so we can restore original permissions
     for layer in $layers; do
         echo -en "${layer:0:12}: Untarring"
-        tar -${decompress}xOf $image $layer | tar -x -C ${rootfs}
+        # Use fakeroot to "wrap" tar to minimise potential permission issues.
+        tar -${decompress}xOf $image $layer | fakeroot -- tar -x -C ${rootfs}
         echo -en "\r${layer:0:12}: Untar complete        \n"
 
         unwritable_dirs+=($(chmod_unwritable_dirs "$rootfs"))
