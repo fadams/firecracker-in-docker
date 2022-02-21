@@ -53,6 +53,10 @@
 # FC_MEM_SIZE: Set mem_size_mib (ignored if --memory= is used). Default is 2048
 # FC_HT_ENABLED: Enable hyperthreading. Disabled by default, which seems
 #   to be the case for most Firecracker examples.
+# FC_UID: Set the UID of the Firecracker user. The default is a pseudorandom
+#   value between 1000 and 33767. Setting this to 0 keeps the guest running
+#   as root. In general it's better to run as an unprivileged user, but some
+#   images need to be run as root and also it's a useful debugging option.
 #-------------------------------------------------------------------------------
 
 # https://vaneyckt.io/posts/safer_bash_scripts_with_set_euxo_pipefail/
@@ -86,12 +90,13 @@ if [ ! -f $ROOTFS ]; then
 fi
 
 # Resize the root filesystem based on the FC_EPHEMERAL_STORAGE settings.
-# The firecracker-in-docker images mages created by image-builder are built
+# The firecracker-in-docker images created by image-builder are built
 # with the root filesystem deliberately shrunk to contain only those blocks
 # that are actually used. This step will grow it again to a configurable
 # (or default) larger size that in essence creates some (ephemeral) writable
 # space analogous to a regular container's writable layer.
-# Run e2fsck with -y to non-interactively fix any issues with rootfs.
+#
+# First run e2fsck with -y to non-interactively fix any issues with rootfs.
 # The && true prevents any non zero error code causing the script to terminate.
 e2fsck -y $ROOTFS &>/dev/null && true
 if [ -z ${FC_EPHEMERAL_STORAGE+x} ]; then # If FC_EPHEMERAL_STORAGE is unset
@@ -170,6 +175,16 @@ FC_KERNEL_BOOTARGS="${FC_KERNEL_BOOTARGS:-}"  # No additional args by default.
 BOOT_ARGS="ro noapic console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on i8042.noaux i8042.nomux i8042.nopnp i8042.dumbkbd tsc=reliable ipv6.disable=1 loglevel=${FC_KERNEL_LOGLEVEL}"
 
 
+# By default the last thing we do when initing Firecracker is to exec chpst,
+# to replace init with the application ENTRYPOINT running as an unprivileged
+# user with a pseudorandom UID. If instead we set FC_UID=0 this behaviour
+# will be overridded and init will directly exec the application ENTRYPOINT,
+# which will then run as root in the Firecracker guest. In general it's better
+# to run the application as an unprivileged user, but some images need to be
+# run as root and also it's a useful debugging option.
+FC_UID="${FC_UID:-$(($RANDOM + 1000))}" # Default UID between 1000 and 33767
+
+
 # Infer env vars that have been added at run-time via Docker's -e/--env
 # by comparing against a list of "standard" variables. Note that this
 # approach will fail if an application actually happens to *want* to
@@ -181,7 +196,7 @@ BOOT_ARGS="ro noapic console=ttyS0 reboot=k panic=1 pci=off random.trust_cpu=on 
 #
 # The parsing approach used below is based on the following stackoverflow post.
 # https://stackoverflow.com/questions/56633343/print-all-environment-variables-but-skipping-multiline-variables
-CONTAINER_ENV_VARS=""
+CONTAINER_ENV_VARS="export \"UID=$FC_UID\"\n"
 while read -r -d '' line; do
     [[ ! $line =~ ^(HOSTNAME|PWD|HOME|TERM|SHLVL|PATH|OLDPWD|_|FC_.*)= ]] && CONTAINER_ENV_VARS=${CONTAINER_ENV_VARS}$(echo "export \"$(echo $line | sed -e 's/__\(.*\)__/\1/g')\"")"\n"
 done < <(env -0)
@@ -286,6 +301,8 @@ echo "$(cat /etc/hostname)-firecracker" | e2cp -O 0 -G 0 - ${ROOTFS}:/etc/hostna
 e2cp -p /etc/resolv.conf ${ROOTFS}:/etc/resolv.conf
 
 
+# Initialise the network configuration that will be used later to create
+# the interfaces and establish the routing from container to Firecracker.
 INTERFACE=eth0
 TAP_DEVICE_NAME="tap0"
 

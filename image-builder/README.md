@@ -1,6 +1,62 @@
 # image-builder
 This directory provides [image-builder](image-builder), a tool to transform regular Docker images into a root filesystem for Firecracker and a directory containing the kernel, root filesystem, and Dockerfile needed to build the firecracker-in-docker image created from the source image.
 
+## Usage
+N.B. a working Firecracker kernel, e.g. as built by [kernel-builder](../kernel-builder), is required before using image-builder.
+
+To use image-builder properly, either update the PATH environment variable to include the [image-builder](../image-builder) directory, or create a symlink to the image-builder executable from one of the directories already on PATH.
+
+The basic usage is:
+```
+image-builder <name>
+```
+That will build a root filesystem from the specified source image `<name>` and create a `firecracker-<name>` directory containing the Dockerfile, kernel, root filesystem etc. The generated Dockerfile may be used to create a `firecracker-<name>` image in the usual way.
+
+As a simple concrete example, use the `hello-world` image mentioned in the [Docker installation documentation](https://docs.docker.com/engine/install/ubuntu/) that is used to check if the Docker installation was successful:
+```
+image-builder hello-world
+```
+This will directly pull the image layers from DockerHub (without requiring Docker), unpack the layers, then generate a root filesystem. It will then create a firecracker-hello-world directory containing the standalone Dockerfile, kernel, root filesystem etc.
+
+if we:
+```
+cd firecracker-hello-world
+```
+then:
+```
+docker build -t firecracker-hello-world .
+```
+that will hopefully result in our firecracker-hello-world image being created.
+
+To run:
+```
+./firecracker-hello-world
+```
+Instead of generating a standalone Dockerfile, we could instead build a firecracker-in-docker base image by using the [Dockerfile](../launcher/Dockerfile) in the [launcher](../launcher) directory.
+
+If we delete the generated firecracker-hello-world directory created by the previous example and now do:
+```
+image-builder -b hello-world
+```
+That will again create a generated firecracker-hello-world directory, but this time the contents will be simpler as we now rely on the base image to do the heavy lifting.
+
+If a name other than firecracker-in-docker is required for the base image, simply use any desired name when building the base image and provide that to the `-b` option, e.g.
+```
+image-builder -b <base-image-name> hello-world
+```
+By default, the image-builder will attempt to shrink the root filesystem to its minimum size, which means that the final built firecracker-in-docker images will be as small as possible. By default the firestarter ENTRYPOINT of the container will expand the root filesystem on container startup.
+
+It is possible to specify a preferred image size using the `-s` option:
+```
+image-builder -b -s 300M hello-world
+```
+which will create a root filesystem of 300MiB.
+
+To prevent firestarter from attempting to resize a root filesystem that is already of the required size, the container should be started with the FC_EPHEMERAL_STORAGE environment variable set to zero:
+```
+-e FC_EPHEMERAL_STORAGE=0
+```
+
 ## Implementation Details
 The following steps are performed by the image-builder.
 
@@ -16,7 +72,7 @@ With Docker, containers use [Linux namespaces](https://en.wikipedia.org/wiki/Lin
 
 We would ideally like applications running in our firecracker-in-docker guest MicroVMs to behave in a similar way to how they do when run as regular containers, that is to say running as the PID 1 process. In theory we could simply configure the guest kernel to use the containerised application as init directly, however in most cases we also have to consider additional information like environment variables, WORKDIR, hostname, CMD and command line arguments, etc.
 
-To cater for these additional requirements, we generate a simple init script for the Firecracker guest so that it inits in a similar way to a Docker container.
+To cater for these additional requirements we generate a simple init script for the Firecracker guest, so that it inits in a similar way to a Docker container.
 
 If the Docker image specifies an ENTRYPOINT of /sbin/init we use that directly. If, however, the image specifies a regular application as the ENTRYPOINT or CMD, as is more typical with Docker images, we generate a simple init-entrypoint script that will set the ENV vars specified in the image or passed at run time and also set WORKDIR, hostname, mount /proc, then finally exec the specified ENTRYPOINT/CMD application so that it replaces the init-entrypoint script as PID 1.
 
@@ -58,7 +114,16 @@ and **not**
 ```
 [/bin/sh, -c, echo, "Hello, World"]
 ```
-After extracting the ENV, CMD and ENTRYPOINT values into arrays, we check whether ENTRYPOINT or CMD is /sbin/init and if so we will just use that, because init systems like systemd will set the hostname and mount /proc themselves.
+After extracting the ENV, CMD and ENTRYPOINT values into arrays we test if ENTRYPOINT_OVERRIDE is set. This variable is set by the `--entrypoint` command line option and allows us to override the ENTRYPOINT specified in the image with another value. This option is mainly useful when trying to get images to work in Firecracker where we may wish to us a shell like `/bin/sh` as a temporary ENTRYPOINT.
+```
+if [ ! -z ${ENTRYPOINT_OVERRIDE+x} ]; then
+  echo "Warning: --entrypoint=$ENTRYPOINT_OVERRIDE option overrides image ENTRYPOINT"
+  ENTRYPOINT=("$ENTRYPOINT_OVERRIDE")
+  CMD=()
+fi
+```
+
+We next check whether ENTRYPOINT or CMD is /sbin/init and if so we will just use that, because init systems like systemd will set the hostname and mount /proc themselves.
 ```
 if [[ "${ENTRYPOINT[@]}" == "/sbin/init" ]]; then
   echo "ENTRYPOINT is /sbin/init, using that"
@@ -89,13 +154,15 @@ check_and_install() {
       curl -fsSL "$busybox_path/busybox_CAT" -o busybox_cache/cat
       echo "Downloading busybox_MOUNT to local cache"
       curl -fsSL "$busybox_path/busybox_MOUNT" -o busybox_cache/mount
+      echo "Downloading busybox_CHPST to local cache"
+      curl -fsSL "$busybox_path/busybox_CHPST" -o busybox_cache/chpst
       chmod +x busybox_cache/*
     fi
     cp busybox_cache/${name} ${rootfs}${executable}
   fi
 }
 ```
-In due course it might be worth creating an init-entrypoint that is a standalone static executable to better support scratch images.
+In due course it might be worth creating an init-entrypoint that is a standalone static executable binary to better support scratch images.
 
 We use `check_and_install` as follows, which will install the required executables into the guest's root filesystem if they don't already exist:
 ```
@@ -103,6 +170,10 @@ check_and_install $rootfs /bin/sh
 check_and_install $rootfs /bin/hostname
 check_and_install $rootfs /bin/cat
 check_and_install $rootfs /bin/mount
+# setpriv or unshare would probably be more obvious than chpst
+# https://man.archlinux.org/man/busybox.1.en#chpst
+# but busybox versions of those don't support setting uid/euid
+check_and_install $rootfs /bin/chpst
 ```
 To generate the init-entrypoint script, we start by setting the shebang to `#!/bin/sh`then generate the environment variables specified in the image by iterating our ENV array.
 ```
@@ -117,7 +188,7 @@ env="${env}[ -f /etc/profile.d/01-container-env-vars.sh ] && . /etc/profile.d/01
 ```
 We next generate code to set hostname, WORKDIR, and mount /proc for the init script, and make sure /tmp has the correct 1777 permissions:
 ```
-local misc="hostname "'$(cat /etc/hostname)'"\n[ -d /proc ] && mount -t proc proc /proc\n[ -d /tmp ] && chmod 1777 /tmp \ncd $workdir\n"
+local misc="[ -d /proc ] && mount -t proc proc /proc\n[ -d /tmp ] && chmod 1777 /tmp \nhostname "'$(cat /etc/hostname)'"\ncd $workdir\n"
 ```
 We then generate code to set the ENTRYPOINT for the init script. This also extracts any command line args for init that may have been packed into the INIT_ARGS enviroment variable by [firestarter](launcher/resources/firestarter) in lieu of being properly set in the boot parameters.
 ```
@@ -141,7 +212,9 @@ fi
 Finally, we actually generate the complete /sbin/init-entrypoint from the fragments that we created earlier and make it executable.
 ```
 mkdir -p $rootfs/sbin # Make sure /sbin directory exists
-echo -e "${shell}${env}${misc}${execute}exec "'"$@"' > $rootfs/sbin/init-entrypoint
+# Need to use chpst to set uid as busybox setpriv and
+# unshare don't support setting uid/euid.
+echo -e "${shell}${env}${misc}${execute}"'if [ "$UID" = 0 ]; then\n  exec "$@"\nelse\n  exec chpst -u "$UID":0 "$@"\nfi' > $rootfs/sbin/init-entrypoint
 chmod 755 $rootfs/sbin/init-entrypoint
 ```
 An example generated /sbin/init-entrypoint script for a simple Ubuntu based image with no ENTRYPOINT or CMD explicitly set looks like:
@@ -149,9 +222,9 @@ An example generated /sbin/init-entrypoint script for a simple Ubuntu based imag
 #!/bin/sh
 export "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 [ -f /etc/profile.d/01-container-env-vars.sh ] && . /etc/profile.d/01-container-env-vars.sh
-hostname $(cat /etc/hostname)
 [ -d /proc ] && mount -t proc proc /proc
-[ -d /tmp ] && chmod 1777 /tmp 
+[ -d /tmp ] && chmod 1777 /tmp
+hostname $(cat /etc/hostname)
 cd /
 # Transform the INIT_ARGS env var into real args
 eval "set -- $INIT_ARGS"
@@ -159,9 +232,12 @@ eval "set -- $INIT_ARGS"
 unset INIT_ARGS
 # If any args have been passed use those, otherwise use CMD
 [ -z "$1" ] && eval "set --  \"/bin/bash\""
-exec "$@"
+if [ "$UID" = 0 ]; then
+  exec "$@"
+else
+  exec chpst -u "$UID":0 "$@"
+fi
 ```
-
 ### Generate and minimise the root filesystem
 After unpacking the image to create the root filesystem contents then generating /sbin/init-entrypoint, we next need to create the actual ext4 root filesystem.
 
@@ -275,59 +351,3 @@ docker run --rm -it \
   firecracker-hello-world
 ```
 and generate a template README.md for the directory
-
-## Usage
-N.B. a working Firecracker kernel, e.g. as built by [kernel-builder](../kernel-builder), is required before using image-builder.
-
-To use image-builder properly, either update the PATH environment variable to include the [image-builder](../image-builder) directory, or create a symlink to the image-builder executable from one of the directories already on PATH.
-
-The basic usage is:
-```
-image-builder <name>
-```
-That will build a root filesystem from the specified source image `<name>` and create a `firecracker-<name>` directory containing the Dockerfile, kernel, root filesystem etc. The generated Dockerfile may be used to create a `firecracker-<name>`image in the usual way.
-
-As a simple concrete example, use the hello-world image mentioned in the [Docker installation documentation](https://docs.docker.com/engine/install/ubuntu/) that is used to check if the Docker installation was successful:
-```
-image-builder hello-world
-```
-This will directly pull the image layers from DockerHub (without requiring Docker), unpack the layers, then generate a root filesystem. It will then create a firecracker-hello-world directory containing the standalone Dockerfile, kernel, root filesystem etc.
-
-if we:
-```
-cd firecracker-hello-world
-```
-then:
-```
-docker build -t firecracker-hello-world .
-```
-that will hopefully result in our firecracker-hello-world image being created.
-
-To run:
-```
-./firecracker-hello-world
-```
-Instead of generating a standalone Dockerfile, we could instead build a firecracker-in-docker base image by using the [Dockerfile](../launcher/Dockerfile) in the [launcher](../launcher) directory.
-
-If we delete the generated firecracker-hello-world directory created by the previous example and now do:
-```
-image-builder -b hello-world
-```
-That will again create a generated firecracker-hello-world directory, but this time the contents will be simpler as we now rely on the base image to do the heavy lifting.
-
-If a name other than firecracker-in-docker is required for the base image, simply use any desired name when building the base image and provide that to the `-b` option, e.g.
-```
-image-builder -b <base-image-name> hello-world
-```
-By default, the image-builder will attempt to shrink the root filesystem to its minimum size, which means that the final built firecracker-in-docker images will be as small as possible. By default the firestarter ENTRYPOINT of the container will expand the root filesystem on container startup.
-
-It is possible to specify a preferred image size using the `-s` option:
-```
-image-builder -b -s 300M hello-world
-```
-which will create a root filesystem of 300MiB.
-
-To prevent firestarter from attempting to resize a root filesystem that is already of the required size, the container should be started with the FC_EPHEMERAL_STORAGE environment variable set to zero:
-```
--e FC_EPHEMERAL_STORAGE=0
-```

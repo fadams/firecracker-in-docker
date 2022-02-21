@@ -1,6 +1,80 @@
 # launcher
 The launcher is really the core component of firecracker-in-docker and serves as either a *template* Dockerfile and launch script for when the [image-builder](../image-builder) has been configured to create *standalone* Dockerfiles, or as the base image when the [image-builder](../image-builder) has been configured to create *derived* Dockerfiles.
 
+## Usage
+As a prerequisite, the firecracker-in-docker launcher requires an appropriately configured Linux kernel to be compiled and copied to [kernel/vmlinux](kernel/vmlinux). The best way to obtain a kernel is to follow the instructions in the [kernel-builder](../kernel-builder) section of this repository.
+
+Once a kernel has been built and copied to [kernel/vmlinux](kernel/vmlinux), to build the firecracker-in-docker base image run:
+```
+docker build -t firecracker-in-docker .
+```
+Another prerequisite is for a root filesystem to be built and copied to [rootfs/rootfs.ext4](rootfs/rootfs.ext4). The most straightforward way to create the required root filesystem is to use the [image-builder](../image-builder), which will create a copy of this launcher directory, generate the root filesystem from the specified source Docker image, and generate a modified Dockerfile in the copy of the launcher directory that has been created for the new image.
+
+The [examples](../examples) directory illustrates the whole process of using [image-builder](../image-builder) to generate new firecracker-in-docker images for a few representative sample Docker images.
+
+Where a suitable root filesystem already exists, an alternative to using image-builder is simply to copy the root filesystem to [rootfs/rootfs.ext4](rootfs/rootfs.ext4) then bind-mount rootfs/rootfs.ext4 into our firecracker-in-docker container:
+```
+-v $PWD/rootfs/rootfs.ext4:/usr/local/bin/rootfs.ext4
+```
+In general though, the best way to run firecracker-in-docker is to use the [image-builder](../image-builder), which will create a directory with a Dockerfile, launch script, kernel and root filesystem and this launcher directory is really just a template for that, however bind-mounting a root filesystem can be a useful way to quickly try new filesystems using the base firecracker-in-docker image.
+### Running the container
+#### Run time container settings
+A firecracker-in-docker container is really just a regular Docker container, however some specific settings are required so the following example [firecracker](firecracker) launch script serves as a useful starting point.
+```
+docker run --rm -it \
+  --cap-drop all \
+  --cap-add NET_RAW \
+  --cap-add NET_ADMIN \
+  --group-add $(cut -d: -f3 < <(getent group kvm)) \
+  --device=/dev/kvm \
+  --device /dev/net/tun \
+  -u $(id -u):$(id -g) \
+  -v $PWD/rootfs/rootfs.ext4:/usr/local/bin/rootfs.ext4 \
+  firecracker-in-docker
+```
+We could have simply used `--cap-add NET_ADMIN` above, as NET_RAW is included in the Docker [default list of capabilities](https://docs.docker.com/engine/reference/run/#runtime-privilege-and-linux-capabilities), but in general it is better to first drop all capabilities then selectively add only those that are *actually* required to run an application. These capabilities are needed to run ip and iptables, used to set up the network between the container and Firecracker.
+
+Ideally we would like to start our containers with the  `--security-opt no-new-privileges` [security configuration](https://docs.docker.com/engine/reference/run/#security-configuration), which prevents container processes from gaining new privileges. Unfortunately, however, that's not an option with firecracker-in-docker because we use copies of ip and iptables that have [additional capabilities set](https://www.kernel.org/doc/html/latest/userspace-api/no_new_privs.html) and the no-new-privileges flag blocks file capabilities.
+
+Firecracker relies on hardware virtualisation, so our container needs access to the /dev/kvm device:
+```
+--device=/dev/kvm
+```
+in addition to adding the /dev/kvm device, the container process needs to be a member of the kvm group, which may be added as one of its supplementary groups.
+```
+--group-add $(cut -d: -f3 < <(getent group kvm))
+```
+The subshell command above is simply a way to obtain the host's kvm group ID number and if we already know that we could simply use that instead, e.g.
+```
+--group-add 108
+```
+Firecracker emulated network devices are backed by [TAP devices on the host](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#host-networking-integration), so our container needs access to the /dev/tun device.
+```
+--device /dev/net/tun
+```
+In order to run as an unpriviliged user we set:
+```
+-u $(id -u):$(id -g)
+```
+which sets the user and group ID of the container process to those of the user running the command, however we can use any arbitrary non-root user ID.
+
+In this example we bind-mount rootfs/rootfs.ext4 into our firecracker-in-docker container:
+```
+-v $PWD/rootfs/rootfs.ext4:/usr/local/bin/rootfs.ext4
+```
+In general the best way to run firecracker-in-docker is to use the [image-builder](../image-builder), which will create a directory with a Dockerfile, launch script, kernel and root filesystem and this launcher directory is really just a template for that, however bind-mounting a root filesystem can be a useful way to quickly try new filesystems using the base firecracker-in-docker image.
+
+#### Environment variables
+The following configuration environment variables are currently supported:
+
+- FC_KERNEL_LOGLEVEL: Set the guest kernel `loglevel=` [boot parameter](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html) value. The range is from 0 (KERN_EMERG) to 7 (KERN_DEBUG) and the default value is 0, which essentially disables the kernel logs.
+- FC_KERNEL_BOOTARGS: Set or override guest kernel boot parameter values. This allows advanced users to specify specific values e.g. using -e FC_KERNEL_BOOTARGS="8250.nr_uarts=0" could improve boot time at the expense of disabling the serial console (which may lead to unexpected behaviour). Your mileage may vary  with the FC_KERNEL_BOOTARGS option and the defaults seem OK.
+- FC_EPHEMERAL_STORAGE: Configures the root filesystem size. If unset the default is to resize the root filesystem to double its minimised size. If it is set to a value greater than zero then the root filesystem will be resized to the specified size, as interpreted by [resize2fs](https://man7.org/linux/man-pages/man8/resize2fs.8.html). If set to zero  then the root filesystem will not be resized.
+- FC_VCPU_COUNT: Set the vcpu_count (ignored if `--cpus=` is used).
+- FC_MEM_SIZE: Set the mem_size_mib (ignored if `--memory=` is used).
+- FC_HT_ENABLED: Enable hyperthreading. Disabled by default, which seems to be the case for most Firecracker examples.
+- FC_UID: Set the UID of the Firecracker user. The default is a pseudorandom value between 1000 and 33767. Setting this to 0 keeps the guest running as root. In general it's better to run as an unprivileged user, but some images need to be run as root and also it's a useful debugging option.
+
 ## Implementation Details
 ### Overview
 A firecracker-in-docker container is really just a regular Docker container that may be run in exactly the same way as any other Docker container, that is to say it has no dependencies on any particular container runtime.
@@ -193,6 +267,12 @@ The `tsc=reliable` option disables clocksource verification at runtime as well a
 
 The `ipv6.disable=1` option is because we're routing internally using ipv4, so we may as well reduce boot time and available guest kernel surface.
 
+#### Initialise the Guest UID
+By default the last thing we do when initing Firecracker is to `exec chpst`, to replace init with the application ENTRYPOINT running as an unprivileged user with a pseudorandom UID. If instead we set FC_UID=0 this behaviour will be overridded and init will directly exec the application ENTRYPOINT, which will then run as root in the Firecracker guest. In general it's better to run the application as an unprivileged user, but some images need to be run as root and also it's a useful debugging option.
+```
+FC_UID="${FC_UID:-$(($RANDOM + 1000))}"
+```
+
 #### Infer environment variables
 Before starting Firecracker, firestarter attempts to "infer" any environment variables that may have been added at run-time via Docker's `-e` or `--env` options by comparing against a list of "standard" variables.
 
@@ -200,7 +280,7 @@ Note that this approach will fail if an application actually happens to *want* t
 
 The parsing approach that is used below is based on the stackoverflow post https://stackoverflow.com/questions/56633343/print-all-environment-variables-but-skipping-multiline-variables.
 ```
-CONTAINER_ENV_VARS=""
+CONTAINER_ENV_VARS="export \"UID=$FC_UID\"\n"
 while read -r -d '' line; do
   [[ ! $line =~ ^(HOSTNAME|PWD|HOME|TERM|SHLVL|PATH|OLDPWD|_|FC_.*)= ]] && CONTAINER_ENV_VARS=${CONTAINER_ENV_VARS}$(echo "export \"$(echo $line | sed -e 's/__\(.*\)__/\1/g')\"")"\n"
 done < <(env -0)
@@ -355,63 +435,6 @@ Firecracker is then started using the generated vmconfig.json. We use `env -i` t
 exec env -i /usr/local/bin/firecracker --no-api --config-file /tmp/vmconfig.json
 ```
 &nbsp;
-### Running the container
-#### Run time container settings
-As mentioned in the overview section, a firecracker-in-docker container is really just a regular Docker container, however some specific settings are required so the following example [firecracker](firecracker) launch script serves as a useful starting point.
-```
-docker run --rm -it \
-  --cap-drop all \
-  --cap-add NET_RAW \
-  --cap-add NET_ADMIN \
-  --group-add $(cut -d: -f3 < <(getent group kvm)) \
-  --device=/dev/kvm \
-  --device /dev/net/tun \
-  -u $(id -u):$(id -g) \
-  -v $PWD/rootfs/rootfs.ext4:/usr/local/bin/rootfs.ext4 \
-  firecracker-in-docker
-```
-We could have simply used `--cap-add NET_ADMIN` above, as NET_RAW is included in the Docker [default list of capabilities](https://docs.docker.com/engine/reference/run/#runtime-privilege-and-linux-capabilities), but in general it is better to first drop all capabilities then selectively add only those that are *actually* required to run an application. These capabilities are needed to run ip and iptables, used to set up the network between the container and Firecracker.
-
-Ideally we would like to start our containers with the  `--security-opt no-new-privileges` [security configuration](https://docs.docker.com/engine/reference/run/#security-configuration), which prevents container processes from gaining new privileges. Unfortunately, however, that's not an option with firecracker-in-docker because we use copies of ip and iptables that have [additional capabilities set](https://www.kernel.org/doc/html/latest/userspace-api/no_new_privs.html).
-
-Firecracker relies on hardware virtualisation, so our container needs access to the /dev/kvm device:
-```
---device=/dev/kvm
-```
-in addition to adding the /dev/kvm device, the container process needs to be a member of the kvm group, which may be added as one of its supplementary groups.
-```
---group-add $(cut -d: -f3 < <(getent group kvm))
-```
-The subshell command above is simply a way to obtain the host's kvm group ID number and if we already know that we could simply use that instead, e.g.
-```
---group-add 108
-```
-Firecracker emulated network devices are backed by [TAP devices on the host](https://github.com/firecracker-microvm/firecracker/blob/main/docs/design.md#host-networking-integration), so our container needs access to the /dev/tun device.
-```
---device /dev/net/tun
-```
-In order to run as an unpriviliged user we set:
-```
--u $(id -u):$(id -g)
-```
-which sets the user and group ID of the container process to those of the user running the command, however we can use any arbitrary non-root user ID.
-
-In this example we bind-mount rootfs/rootfs.ext4 into our firecracker-in-docker container:
-```
--v $PWD/rootfs/rootfs.ext4:/usr/local/bin/rootfs.ext4
-```
-In general the best way to run firecracker-in-docker is to use the [image-builder](../image-builder), which will create a directory with a Dockerfile, launch script, kernel and root filesystem and this launcher directory is really just a template for that, however bind-mounting a root filesystem can be a useful way to quickly try new filesystems using the base firecracker-in-docker image.
-
-#### Environment variables
-The following configuration environment variables are currently supported:
-
-- FC_KERNEL_LOGLEVEL: Set the guest kernel `loglevel=` [boot parameter](https://www.kernel.org/doc/html/latest/admin-guide/kernel-parameters.html) value. The range is from 0 (KERN_EMERG) to 7 (KERN_DEBUG) and the default value is 0, which essentially disables the kernel logs.
-- FC_KERNEL_BOOTARGS: Set or override guest kernel boot parameter values. This allows advanced users to specify specific values e.g. using -e FC_KERNEL_BOOTARGS="8250.nr_uarts=0" could improve boot time at the expense of disabling the serial console (which may lead to unexpected behaviour). Your mileage may vary  with the FC_KERNEL_BOOTARGS option and the defaults seem OK.
-- FC_EPHEMERAL_STORAGE: Configures the root filesystem size. If unset the default is to resize the root filesystem to double its minimised size. If it is set to a value greater than zero then the root filesystem will be resized to the specified size, as interpreted by [resize2fs](https://man7.org/linux/man-pages/man8/resize2fs.8.html). If set to zero  then the root filesystem will not be resized.
-- FC_VCPU_COUNT: Set the vcpu_count (ignored if `--cpus=` is used).
-- FC_MEM_SIZE: Set the mem_size_mib (ignored if `--memory=` is used).
-- FC_HT_ENABLED: Enable hyperthreading. Disabled by default, which seems to be the case for most Firecracker examples.
-&nbsp;
 ### What about the Firecracker Jailer?
 The Firecracker documentation recommends using [Jailer](https://github.com/firecracker-microvm/firecracker/blob/main/docs/jailer.md) in a production Firecracker deployment.
 
@@ -442,21 +465,3 @@ setcap cap_chown,cap_dac_override,cap_mknod,cap_setgid,cap_setuid,cap_sys_admin,
 In addition to requiring a large set of highly privileged capabilities, a custom seccomp profile is required to add `pivot_root `to the container's seccomp allow list (CAP_SYS_ADMIN ungates unshare, but that capability is already very privileged). A custom AppArmor profile is also required to enable mount and umount, among other things.
 
 On balance, therefore, it does not seem sensible to increase the privileges of the container just to run Jailer, when the container itself provides at least the same level of additional isolation a Jailer.
-
-## Usage
-As a prerequisite, the firecracker-in-docker launcher requires an appropriately configured Linux kernel to be compiled and copied to [kernel/vmlinux](kernel/vmlinux). The best way to obtain a kernel is to follow the instructions in the [kernel-builder](../kernel-builder) section of this repository.
-
-Once a kernel has been built and copied to [kernel/vmlinux](kernel/vmlinux), to build the firecracker-in-docker base image run:
-```
-docker build -t firecracker-in-docker .
-```
-
-Another prerequisite is for a root filesystem to be built and copied to [rootfs/rootfs.ext4](rootfs/rootfs.ext4). The most straightforward way to create the required root filesystem is to use the [image-builder](../image-builder), which will create a copy of this launcher directory, generate the root filesystem from the specified source Docker image, and generate a modified Dockerfile in the copy of the launcher directory that has been created for the new image.
-
-The [examples](../examples) directory illustrates the whole process of using [image-builder](../image-builder) to generate new firecracker-in-docker images for a few representative sample Docker images.
-
-Where a suitable root filesystem already exists, an alternative to using image-builder is simply to copy the root filesystem to [rootfs/rootfs.ext4](rootfs/rootfs.ext4) then bind-mount rootfs/rootfs.ext4 into our firecracker-in-docker container:
-```
--v $PWD/rootfs/rootfs.ext4:/usr/local/bin/rootfs.ext4
-```
-In general though, the best way to run firecracker-in-docker is to use the [image-builder](../image-builder), which will create a directory with a Dockerfile, launch script, kernel and root filesystem and this launcher directory is really just a template for that, however bind-mounting a root filesystem can be a useful way to quickly try new filesystems using the base firecracker-in-docker image.

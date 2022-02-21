@@ -189,7 +189,7 @@ check_and_install() {
         mkdir -p $rootfs/bin
 
         if [ ! -d "busybox_cache" ]; then
-            local busybox_path="https://www.busybox.net/downloads/binaries/1.30.0-i686"
+            local busybox_path="https://www.busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/"
             mkdir -p busybox_cache
             echo "Downloading busybox_ASH to local cache"
             curl -fsSL "$busybox_path/busybox_ASH" -o busybox_cache/sh
@@ -199,6 +199,8 @@ check_and_install() {
             curl -fsSL "$busybox_path/busybox_CAT" -o busybox_cache/cat
             echo "Downloading busybox_MOUNT to local cache"
             curl -fsSL "$busybox_path/busybox_MOUNT" -o busybox_cache/mount
+            echo "Downloading busybox_CHPST to local cache"
+            curl -fsSL "$busybox_path/busybox_CHPST" -o busybox_cache/chpst
             chmod +x busybox_cache/*
         fi
         cp busybox_cache/${name} ${rootfs}${executable}
@@ -238,6 +240,15 @@ generate_init() {
     local ENTRYPOINT=($(echo "$config" | jq --raw-output 'try .Entrypoint[]'))
     IFS=$SAVEIFS # Restore IFS
 
+    # The --entrypoint allows the image ENTRYPOINT to be overridden by the
+    # specified executable. This is mostly useful when debugging why an
+    # image isn't working, where we can specify a shell as the ENTRYPOINT.
+    if [ ! -z ${ENTRYPOINT_OVERRIDE+x} ]; then
+        echo "Warning: --entrypoint=$ENTRYPOINT_OVERRIDE option overrides image ENTRYPOINT"
+        ENTRYPOINT=("$ENTRYPOINT_OVERRIDE")
+        CMD=()
+    fi
+
     # If the ENTRYPOINT/CMD is /sbin/init we will just use that, because init
     # systems like systemd will set the hostname and mount /proc themselves.
     if [[ "${ENTRYPOINT[@]}" == "/sbin/init" ]]; then
@@ -261,6 +272,10 @@ generate_init() {
         check_and_install $rootfs /bin/hostname
         check_and_install $rootfs /bin/cat
         check_and_install $rootfs /bin/mount
+        # setpriv or unshare would probably be more obvious than chpst
+        # https://man.archlinux.org/man/busybox.1.en#chpst
+        # but busybox versions of those don't support setting uid/euid
+        check_and_install $rootfs /bin/chpst
 
 
         local shell="#!/bin/sh\n"
@@ -273,7 +288,7 @@ generate_init() {
 
         # Set hostname, WORKDIR, and mount /proc for the init script,
         # and make sure /tmp has the correct 1777 permissions
-        local misc="hostname "'$(cat /etc/hostname)'"\n[ -d /proc ] && mount -t proc proc /proc\n[ -d /tmp ] && chmod 1777 /tmp \ncd $workdir\n"
+        local misc="[ -d /proc ] && mount -t proc proc /proc\n[ -d /tmp ] && chmod 1777 /tmp \nhostname "'$(cat /etc/hostname)'"\ncd $workdir\n"
 
         # Set ENTRYPOINT for init script. This also extracts any command
         # line args for init that are packed into the INIT_ARGS env var
@@ -288,7 +303,7 @@ generate_init() {
             cmd="${cmd} "'\"'"${entry}"'\"'""
         done
 
-        local execute="# Transform the INIT_ARGS env var into "real" args\n"
+        local execute="# Transform the INIT_ARGS env var into \"real\" args\n"
         if [[ "${#ENTRYPOINT[@]}" == 0 ]]; then
             execute="${execute}"'eval "set -- $INIT_ARGS"\n# After converting into "real" args remove INIT_ARGS from the environment\nunset INIT_ARGS\n# If any args have been passed use those, otherwise use CMD\n[ -z "$1" ] && eval "set -- '"${cmd}"'"\n'
         else
@@ -296,7 +311,9 @@ generate_init() {
         fi
 
         mkdir -p $rootfs/sbin # Make sure /sbin directory exists
-        echo -e "${shell}${env}${misc}${execute}exec "'"$@"' > $rootfs/sbin/init-entrypoint
+        # Need to use chpst to set uid as busybox setpriv and
+        # unshare don't support setting uid/euid.
+        echo -e "${shell}${env}${misc}${execute}"'if [ "$UID" = 0 ]; then\n  exec "$@"\nelse\n  exec chpst -u "$UID":0 "$@"\nfi' > $rootfs/sbin/init-entrypoint
         chmod 755 $rootfs/sbin/init-entrypoint
     fi
 }
@@ -561,15 +578,18 @@ EOF
 usage() {
 cat <<EOF
 Usage: $(basename $0) [-h --help] [-b --base=<image>] [-s --size=size] <name>
-    -h, --help         display this usage message
-    -b, --base=<image> use <image> as base image of generated Dockerfile.
-                       Defaults to firecracker-in-docker if <image> isn't
-                       specified and generates a standalone Dockerfile if
-                       the -b option isn't specified at all.
-    -s, --size=size    specify root filesystem size. If not specified the
-                       root filesystem is automatically minimised, if set
-                       the size units are interpreted in same way as mke2fs
-                       with 'k', 'm', 'g', 't' upper or lower case suffixes.
+    -h, --help             display this usage message
+    -b, --base=<image>     use <image> as base image of generated Dockerfile.
+                           Defaults to firecracker-in-docker if <image> isn't
+                           specified and generates a standalone Dockerfile if
+                           the -b option isn't specified at all.
+    -e, --entrypoint=<cmd> use <cmd> as the image ENTRYPOINT, overriding the
+                           value set in the image. This is useful for debugging
+                           where we can specify a shell as the ENTRYPOINT. 
+    -s, --size=size        specify root filesystem size. If not specified the
+                           root filesystem is automatically minimised, if set
+                           the size units are interpreted in same way as mke2fs
+                           with 'k', 'm', 'g', 't' upper or lower case suffixes.
 EOF
 }
 
@@ -585,7 +605,6 @@ IMAGE="hello-world"
 SIZE=0
 MOUNTPOINT=rootfs
 FILESYSTEM=rootfs.ext4
-
 
 # Parse the command line arguments
 while [[ $# -gt 0 ]]; do
@@ -606,6 +625,20 @@ while [[ $# -gt 0 ]]; do
             ;;
         -b=*|--base=*)
             BASE="${1#*=}"
+            shift # past argument=value
+            ;;
+        -e|--entrypoint)
+            if [ $# -lt 3 ] || [[ $2 == -* ]]; then
+                echo "entrypoint option requires a value."
+                exit 1
+            fi
+                
+            ENTRYPOINT_OVERRIDE="$2"
+            shift # past argument
+            shift # past value
+            ;;
+        -e=*|--entrypoint=*)
+            ENTRYPOINT_OVERRIDE="${1#*=}"
             shift # past argument=value
             ;;
         -s|--size)
