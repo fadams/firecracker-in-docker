@@ -173,7 +173,7 @@ With regular containers it is possible to run a command in a running container u
 Workarounds include including running an ssh server in the guest, or something more sophisticated like a guest "agent", or even a container runtime on the guest. These would, however, increase complexity and the potential available guest attack surface, whereas the primary goals of firecracker-in-docker are simplicity and security, preferring the lowest possible guest surface needed to actually run the application.
 
 ### Images are not extendable
-With Docker, it is common to create base images and then extend those. However, because firecracker-in-docker images package the application root filesystem into an opaque ext4.rootfs file it is not possible to extend them.
+With Docker, it is common to create base images and then extend those. However, because firecracker-in-docker images package the application root filesystem into an opaque `rootfs.ext4` file it is not possible to extend them.
 
 It should be remembered, however, that the that the **primary** use case for Firecracker is to provide secure, multi-tenant execution of workloads. In general "traditional" distribution base images (even minimal ones like Alpine) include far more binaries and libraries than are *actually* required to run the application and when images are extended the additional package dependencies tend to exacerbate that situation further.
 

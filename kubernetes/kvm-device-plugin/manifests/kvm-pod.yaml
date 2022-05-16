@@ -1,0 +1,41 @@
+# Based on
+# https://github.com/kubevirt/kubevirt/issues/1276
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: kvm-and-tun-consumer
+spec:
+  containers:
+  - name: alpine
+    image: alpine:3.5
+    command: ["/bin/sleep", "36000"]
+    resources:
+      limits:
+        devices.kubevirt.io/kvm: "1"
+    volumeMounts:
+    - mountPath: /dev/net/tun
+      name: dev-tun
+    securityContext:
+      capabilities:
+        add:
+        - NET_ADMIN
+      privileged: false
+  volumes:
+  - hostPath:
+      path: /dev/net/tun
+      type: CharDevice
+    name: dev-tun
+
+
+# kubectl apply -f kvm-pod.yaml
+# kubectl delete -f kvm-pod.yaml
+
+# kubectl exec -it  kvm-and-tun-consumer -- /bin/ash
+
+
+
+# apk add --update qemu-system-x86_64 bzip2 wget
+# wget http://mirrors.us.softlayer.com/coreos/stable/2135.5.0/coreos_production_qemu_image.img.bz2
+# bzip2 -d coreos_production_qemu_image.img.bz2
+# qemu-system-x86_64 -m 1024 -enable-kvm -hda coreos_production_qemu_image.img -nographic

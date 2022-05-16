@@ -1,0 +1,88 @@
+
+# DaemonSet based on
+# https://github.com/kubevirt/kubernetes-device-plugins/blob/master/manifests/kvm-ds.yml
+# and
+# https://gitlab.com/arm-research/smarter/smarter-device-manager/-/blob/master/smarter-device-manager-ds.yaml
+#
+# The kubevirt/kubernetes-device-plugins DaemonSet had `privileged: true`
+# unnecessarily in order to make /dev/kvm visible to the container. However, by
+# adding /dev/kvm to volumeMounts the Device Plugin can see the the device
+# node on the host and the Device Plugin API takes care of setting the cgroups.
+# This is more consistent with using --device = /dev/kvm on Docker, which
+# does not require the container to be privileged.
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: device-manager
+  labels:
+    name: device-manager
+---
+
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: kvm-device-plugin
+  namespace: device-manager
+  labels:
+    name: kvm-device-plugin
+    role: agent
+spec:
+  selector:
+    matchLabels:
+      name: kvm-device-plugin
+  updateStrategy:
+    type: RollingUpdate
+  template:
+    metadata:
+      labels:
+        name: kvm-device-plugin
+    spec:
+      # https://kubernetes.io/docs/tasks/administer-cluster/guaranteed-scheduling-critical-addon-pods/
+      priorityClassName: "system-node-critical"
+      containers:
+      - name: kvm-device-plugin
+        # Using locally built image
+        image: kvm-device-plugin
+        imagePullPolicy: IfNotPresent
+        args: ["-v", "3", "-logtostderr"]
+        # The Device Plugin API does not allow for infinitely available devices
+        # like /dev/kvm, rather the device plugin sends the kubelet the list of
+        # devices it manages, and the kubelet is in charge of advertising those
+        # resources to the API server as part of the kubelet node status update.
+        # The approach taken here is to register a configurable, or arbitrarily
+        # large default, number of available devices (default is 1000).
+        env:
+        - name: AVAILABLE_DEVICES
+          value: "1234"
+        securityContext:
+          # The Device Manager can run with low privileges
+          privileged: false
+          allowPrivilegeEscalation: false
+          readOnlyRootFilesystem: true
+          capabilities:
+            drop: ["ALL"]
+        resources:
+          limits:
+            cpu: 100m
+            memory: 15Mi
+          requests:
+            cpu: 10m
+            memory: 15Mi
+        volumeMounts:
+          - name: device-plugin
+            mountPath: /var/lib/kubelet/device-plugins
+          - name: dev-dir
+            mountPath: /dev/kvm
+      volumes:
+        - name: device-plugin
+          hostPath:
+            path: /var/lib/kubelet/device-plugins
+        - name: dev-dir
+          hostPath:
+            path: /dev/kvm
+
+
+# kubectl apply -f kvm-device-plugin-daemonset.yaml
+# kubectl delete -f kvm-device-plugin-daemonset.yaml
+
